@@ -1,0 +1,29 @@
+{
+  "name": "subscription-dapp",
+  "version": "1.0.0",
+  "description": "A full-stack subscription payment DApp using Solidity, Hardhat, Node.js, and React",
+  "main": "index.js",
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "deploy": "hardhat run scripts/deploy.js --network localhost",
+    "node": "hardhat node",
+    "backend": "cd backend && PORT=3003 npm start",
+    "frontend": "cd frontend && npm start",
+    "dev": "concurrently \"npm run node\" \"npm run backend\" \"npm run frontend\""
+  },
+  "keywords": ["solidity", "hardhat", "ethereum", "dapp", "subscription"],
+  "author": "Your Name",
+  "license": "MIT",
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^4.0.0",
+    "@openzeppelin/contracts": "^5.0.0",
+    "hardhat": "^2.19.0",
+    "chai": "^4.3.10",
+    "ethers": "^6.8.0"
+  },
+  "dependencies": {
+    "dotenv": "^16.3.1",
+    "concurrently": "^8.2.2"
+  }
+}
