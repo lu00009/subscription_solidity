@@ -28,16 +28,19 @@ contract SubscriptionService is Ownable, ReentrancyGuard {
     mapping(address => Subscription) public subscriptions;
     
     // Events
-    event Subscribed(address indexed user, uint256 expiry, Tier tier);
-    event Renewed(address indexed user, uint256 newExpiry, Tier tier);
+    event Subscribed(address indexed user, uint256 expiry, Tier tier, uint256 amount);
+    event Renewed(address indexed user, uint256 newExpiry, Tier tier, uint256 amount);
     event Unsubscribed(address indexed user);
     event Withdrawn(address indexed owner, uint256 amount);
+    event TierPriceUpdated(Tier indexed tier, uint256 oldPrice, uint256 newPrice);
+    event SubscriptionExpired(address indexed user, uint256 expiry);
     
     // Errors
     error AlreadyActive(address user);
     error InsufficientPayment(uint256 paid, uint256 required);
     error InvalidTier(uint8 tier);
     error NoActiveSubscription(address user);
+    error InvalidPrice(uint256 price);
     
     constructor() Ownable(msg.sender) {
         // Initialize tier prices
@@ -70,7 +73,7 @@ contract SubscriptionService is Ownable, ReentrancyGuard {
         uint256 expiry = block.timestamp + SUBSCRIPTION_DURATION;
         subscriptions[msg.sender] = Subscription(expiry, _tier);
         
-        emit Subscribed(msg.sender, expiry, _tier);
+        emit Subscribed(msg.sender, expiry, _tier, requiredPayment);
         
         // Refund excess payment
         if (msg.value > requiredPayment) {
@@ -105,7 +108,7 @@ contract SubscriptionService is Ownable, ReentrancyGuard {
         userSub.expiry += SUBSCRIPTION_DURATION;
         userSub.tier = _tier;
         
-        emit Renewed(msg.sender, userSub.expiry, _tier);
+        emit Renewed(msg.sender, userSub.expiry, _tier, requiredPayment);
         
         // Refund excess payment
         if (msg.value > requiredPayment) {
@@ -197,6 +200,52 @@ contract SubscriptionService is Ownable, ReentrancyGuard {
      * @param _newPrice The new price in wei
      */
     function updateTierPrice(Tier _tier, uint256 _newPrice) external onlyOwner {
+        if (_newPrice == 0) {
+            revert InvalidPrice(_newPrice);
+        }
+        
+        uint256 oldPrice = tierPrices[_tier];
         tierPrices[_tier] = _newPrice;
+        
+        emit TierPriceUpdated(_tier, oldPrice, _newPrice);
+    }
+    
+    /**
+     * @dev Get total number of days remaining for a subscription
+     * @param _user The address to check
+     * @return uint256 Days remaining (0 if expired)
+     */
+    function getDaysRemaining(address _user) external view returns (uint256) {
+        Subscription memory sub = subscriptions[_user];
+        if (sub.expiry <= block.timestamp) {
+            return 0;
+        }
+        return (sub.expiry - block.timestamp) / 1 days;
+    }
+    
+    /**
+     * @dev Check if subscription is expiring soon (within 7 days)
+     * @param _user The address to check
+     * @return bool True if expiring within 7 days
+     */
+    function isExpiringSoon(address _user) external view returns (bool) {
+        Subscription memory sub = subscriptions[_user];
+        if (sub.expiry <= block.timestamp) {
+            return false;
+        }
+        uint256 daysRemaining = (sub.expiry - block.timestamp) / 1 days;
+        return daysRemaining <= 7 && daysRemaining > 0;
+    }
+    
+    /**
+     * @dev Batch check subscription status for multiple addresses
+     * @param _users Array of addresses to check
+     * @return isActive Array of active status for each address
+     */
+    function batchCheckActive(address[] calldata _users) external view returns (bool[] memory isActive) {
+        isActive = new bool[](_users.length);
+        for (uint256 i = 0; i < _users.length; i++) {
+            isActive[i] = subscriptions[_users[i]].expiry > block.timestamp;
+        }
     }
 }

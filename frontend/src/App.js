@@ -1,12 +1,15 @@
-import { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ethers } from 'ethers';
 import axios from 'axios';
 import './App.css';
 
+// ─── Constants ────────────────────────────────────────────────────────────────
 const FALLBACK_LOCAL_CONTRACT = '0x5FbDB2315678afecb367f032d93F642f64180aa3';
 const EXPECTED_CHAIN_ID = Number(process.env.REACT_APP_NETWORK_ID || 1337);
 const TX_HISTORY_STORAGE_KEY = 'subscription_dapp_tx_history';
 const THEME_STORAGE_KEY = 'subscription_dapp_theme';
+const SUBSCRIPTION_DURATION_DAYS = 30;
+const EXPECTED_CHAIN_HEX = `0x${EXPECTED_CHAIN_ID.toString(16)}`;
 
 const contractABI = [
   {
@@ -47,22 +50,26 @@ const contractABI = [
     outputs: [{ internalType: 'uint256', name: '', type: 'uint256' }],
     stateMutability: 'view',
     type: 'function'
+  },
+  {
+    inputs: [],
+    name: 'getBalance',
+    outputs: [{ internalType: 'uint256', name: '', type: 'uint256' }],
+    stateMutability: 'view',
+    type: 'function'
   }
 ];
 
-const api = axios.create({ timeout: 5000 });
+// ─── Axios instance ────────────────────────────────────────────────────────────
+const api = axios.create({ timeout: 8000 });
+
+// ─── Formatters ───────────────────────────────────────────────────────────────
 const preciseDateTimeFormat = new Intl.DateTimeFormat(undefined, {
-  year: 'numeric',
-  month: 'short',
-  day: '2-digit',
-  hour: '2-digit',
-  minute: '2-digit',
-  second: '2-digit'
+  year: 'numeric', month: 'short', day: '2-digit',
+  hour: '2-digit', minute: '2-digit', second: '2-digit'
 });
 const preciseTimeFormat = new Intl.DateTimeFormat(undefined, {
-  hour: '2-digit',
-  minute: '2-digit',
-  second: '2-digit'
+  hour: '2-digit', minute: '2-digit', second: '2-digit'
 });
 const timeZoneLabel = Intl.DateTimeFormat().resolvedOptions().timeZone || 'Local Time';
 
@@ -83,20 +90,26 @@ function formatPreciseTime(value) {
 function formatCountdown(expiry) {
   const now = Math.floor(Date.now() / 1000);
   const timeLeft = Number(expiry) - now;
-
   if (timeLeft <= 0) return 'Expired';
-
-  const days = Math.floor(timeLeft / (24 * 60 * 60));
-  const hours = Math.floor((timeLeft % (24 * 60 * 60)) / 3600);
+  const days    = Math.floor(timeLeft / 86400);
+  const hours   = Math.floor((timeLeft % 86400) / 3600);
   const minutes = Math.floor((timeLeft % 3600) / 60);
   const seconds = timeLeft % 60;
-
   return `${days}d ${hours}h ${minutes}m ${seconds}s`;
+}
+
+function getSubscriptionProgress(expiry) {
+  if (!expiry || Number(expiry) === 0) return 0;
+  const now        = Math.floor(Date.now() / 1000);
+  const totalSecs  = SUBSCRIPTION_DURATION_DAYS * 86400;
+  const startSecs  = Number(expiry) - totalSecs;
+  const elapsed    = now - startSecs;
+  const pct        = Math.min(100, Math.max(0, (elapsed / totalSecs) * 100));
+  return Math.round(pct);
 }
 
 function getErrorMessage(error) {
   if (!error) return 'Unknown error';
-
   return (
     error.shortMessage ||
     error.reason ||
@@ -123,13 +136,11 @@ function toTxKey(tx) {
 
 function mergeTxRecords(primaryList = [], secondaryList = []) {
   const map = new Map();
-
   [...secondaryList, ...primaryList].forEach((item) => {
     const key = toTxKey(item);
     if (!key) return;
     map.set(key, item);
   });
-
   return Array.from(map.values())
     .sort((a, b) => Number(new Date(b.timestamp || b.updatedAt || 0)) - Number(new Date(a.timestamp || a.updatedAt || 0)))
     .slice(0, 20);
@@ -151,35 +162,195 @@ function getInitialTxHistory() {
   }
 }
 
+function detectEthereumProvider() {
+  if (typeof window === 'undefined') return null;
+  const { ethereum } = window;
+  if (!ethereum) return null;
+
+  if (Array.isArray(ethereum.providers) && ethereum.providers.length > 0) {
+    return ethereum.providers.find((provider) => provider?.isMetaMask) || ethereum.providers[0];
+  }
+
+  return ethereum;
+}
+
+// ─── Toast system ─────────────────────────────────────────────────────────────
+let toastIdCounter = 0;
+
+function useToasts() {
+  const [toasts, setToasts] = useState([]);
+
+  const addToast = useCallback((message, type = 'info', duration = 4000) => {
+    const id = ++toastIdCounter;
+    setToasts((prev) => [...prev, { id, message, type }]);
+    setTimeout(() => {
+      setToasts((prev) => prev.filter((t) => t.id !== id));
+    }, duration);
+  }, []);
+
+  const removeToast = useCallback((id) => {
+    setToasts((prev) => prev.filter((t) => t.id !== id));
+  }, []);
+
+  return { toasts, addToast, removeToast };
+}
+
+// ─── Icons ────────────────────────────────────────────────────────────────────
+const CheckIcon = () => (
+  <svg className="w-5 h-5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+  </svg>
+);
+
+const WalletIcon = () => (
+  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+      d="M3 10h18M7 15h1m4 0h1m-7 4h12a3 3 0 003-3V8a3 3 0 00-3-3H6a3 3 0 00-3 3v8a3 3 0 003 3z" />
+  </svg>
+);
+
+const RefreshIcon = ({ spinning }) => (
+  <svg className={`w-4 h-4 ${spinning ? 'animate-spin' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+      d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+  </svg>
+);
+
+const CopyIcon = () => (
+  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+      d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+  </svg>
+);
+
+const ExternalLinkIcon = () => (
+  <svg className="w-3 h-3 inline ml-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+      d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+  </svg>
+);
+
+const ShieldIcon = () => (
+  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+      d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+  </svg>
+);
+
+const StarIcon = () => (
+  <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
+    <path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z" />
+  </svg>
+);
+
+const XIcon = () => (
+  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+  </svg>
+);
+
+// ─── Sub-components ───────────────────────────────────────────────────────────
+
+function ToastContainer({ toasts, onRemove }) {
+  return (
+    <div className="toast-container">
+      {toasts.map((t) => (
+        <div key={t.id} className={`toast toast-${t.type} animate-slide-in-right`}>
+          <span className="flex-1">{t.message}</span>
+          <button onClick={() => onRemove(t.id)} className="opacity-60 hover:opacity-100 transition-opacity">
+            <XIcon />
+          </button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function StatusBadge({ isActive }) {
+  return (
+    <span className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-bold uppercase tracking-wide
+      ${isActive
+        ? 'bg-emerald-100 text-emerald-800 border border-emerald-200 pulse-glow'
+        : 'bg-rose-100 text-rose-800 border border-rose-200'}`}>
+      <span className={`w-2 h-2 rounded-full ${isActive ? 'bg-emerald-500 animate-pulse' : 'bg-rose-400'}`} />
+      {isActive ? 'Active' : 'Inactive'}
+    </span>
+  );
+}
+
+function ProgressBar({ percent, colorClass = 'bg-gradient-to-r from-cyan-500 to-blue-600' }) {
+  return (
+    <div className="progress-bar-track">
+      <div
+        className={`progress-bar-fill ${colorClass}`}
+        style={{ width: `${percent}%` }}
+      />
+    </div>
+  );
+}
+
+function StatCard({ icon, label, value, sub, iconBg = 'bg-cyan-600' }) {
+  return (
+    <div className="stats-card">
+      <div className={`stats-icon ${iconBg}`}>{icon}</div>
+      <div>
+        <p className="stats-label">{label}</p>
+        <p className="stats-value">{value}</p>
+        {sub && <p className="text-xs text-slate-400 mt-0.5">{sub}</p>}
+      </div>
+    </div>
+  );
+}
+
+function FeatureItem({ text }) {
+  return (
+    <li className="flex items-center gap-2 text-sm text-slate-600">
+      <span className="text-cyan-500"><CheckIcon /></span>
+      {text}
+    </li>
+  );
+}
+
+function PremiumFeatureItem({ text }) {
+  return (
+    <li className="flex items-center gap-2 text-sm text-slate-600">
+      <span className="text-orange-500"><CheckIcon /></span>
+      {text}
+    </li>
+  );
+}
+
+// ─── Main App ─────────────────────────────────────────────────────────────────
 function App() {
-  const [contract, setContract] = useState(null);
-  const [account, setAccount] = useState(null);
-  const [chainId, setChainId] = useState(null);
+  // Wallet / chain state
+  const [contract, setContract]   = useState(null);
+  const [account, setAccount]     = useState(null);
+  const [chainId, setChainId]     = useState(null);
+  const [walletBalance, setWalletBalance] = useState(null);
+  const [walletProvider, setWalletProvider] = useState(detectEthereumProvider);
 
-  const [loading, setLoading] = useState(false);
-  const [refreshing, setRefreshing] = useState(false);
-  const [statusLoading, setStatusLoading] = useState(false);
+  // Loading flags
+  const [loading, setLoading]               = useState(false);
+  const [refreshing, setRefreshing]         = useState(false);
+  const [statusLoading, setStatusLoading]   = useState(false);
   const [initialLoadPending, setInitialLoadPending] = useState(true);
-  const [txSyncing, setTxSyncing] = useState(false);
+  const [txSyncing, setTxSyncing]           = useState(false);
   const [switchingNetwork, setSwitchingNetwork] = useState(false);
-  const [error, setError] = useState(null);
-  const [notice, setNotice] = useState(null);
+
+  // UI state
+  const [theme, setTheme]   = useState(getInitialTheme);
   const [copied, setCopied] = useState(false);
-
-  const [theme, setTheme] = useState(getInitialTheme);
-  const [transactions, setTransactions] = useState(getInitialTxHistory);
-
-  const [subscriptionStatus, setSubscriptionStatus] = useState(null);
-  const [countdown, setCountdown] = useState(null);
   const [showUnsubscribeConfirm, setShowUnsubscribeConfirm] = useState(false);
-  const [now, setNow] = useState(() => new Date());
+  const [activeTab, setActiveTab] = useState('dashboard'); // 'dashboard' | 'history'
 
-  const [tierPrices, setTierPrices] = useState({ basic: '0.01', premium: '0.025' });
-  const [lastSyncedAt, setLastSyncedAt] = useState(null);
-  const [stats, setStats] = useState({ totalSubscribers: 0, activeSubscribers: 0, revenue: '0' });
-  const [showStatsPanel, setShowStatsPanel] = useState(false);
-  const [txFilter, setTxFilter] = useState('all'); // all, confirmed, pending, failed
-  const [txSearch, setTxSearch] = useState('');
+  // Data
+  const [transactions, setTransactions]         = useState(getInitialTxHistory);
+  const [subscriptionStatus, setSubscriptionStatus] = useState(null);
+  const [countdown, setCountdown]               = useState(null);
+  const [tierPrices, setTierPrices]             = useState({ basic: null, premium: null });
+  const [lastSyncedAt, setLastSyncedAt]         = useState(null);
+  const [now, setNow]                           = useState(() => new Date());
+  const [contractBalance, setContractBalance]   = useState(null);
 
   const [backend, setBackend] = useState({
     online: false,
@@ -189,106 +360,121 @@ function App() {
     startupError: null
   });
 
-  const filteredTransactions = useMemo(() => {
-    let filtered = transactions;
+  // Toasts
+  const { toasts, addToast, removeToast } = useToasts();
 
-    // Filter by status
-    if (txFilter !== 'all') {
-      filtered = filtered.filter(tx => tx.status === txFilter);
-    }
+  // Refs to avoid stale closures in intervals
+  const accountRef  = useRef(account);
+  const contractRef = useRef(contract);
+  useEffect(() => { accountRef.current  = account;  }, [account]);
+  useEffect(() => { contractRef.current = contract; }, [contract]);
 
-    // Filter by search term
-    if (txSearch.trim()) {
-      const searchLower = txSearch.toLowerCase();
-      filtered = filtered.filter(tx => 
-        tx.type?.toLowerCase().includes(searchLower) ||
-        tx.hash?.toLowerCase().includes(searchLower) ||
-        tx.tier?.toLowerCase().includes(searchLower) ||
-        tx.amount?.toLowerCase().includes(searchLower)
-      );
-    }
+  // ─── Derived values ──────────────────────────────────────────────────────────
+  const walletAvailable  = Boolean(walletProvider);
+  const networkMatches   = chainId === null ? true : Number(chainId) === EXPECTED_CHAIN_ID;
+  const subscriptionProgress = subscriptionStatus?.isActive
+    ? getSubscriptionProgress(subscriptionStatus.expiry)
+    : 0;
 
-    return filtered;
-  }, [transactions, txFilter, txSearch]);
-
-  const walletAvailable = typeof window !== 'undefined' && Boolean(window.ethereum);
-  const networkMatches = chainId === null ? true : Number(chainId) === EXPECTED_CHAIN_ID;
-
-  const effectiveContractAddress = useMemo(() => {
-    return backend.contractAddress || process.env.REACT_APP_CONTRACT_ADDRESS || FALLBACK_LOCAL_CONTRACT;
-  }, [backend.contractAddress]);
+  const effectiveContractAddress = useMemo(() => (
+    backend.contractAddress || process.env.REACT_APP_CONTRACT_ADDRESS || FALLBACK_LOCAL_CONTRACT
+  ), [backend.contractAddress]);
+  const pricesReady = Boolean(tierPrices.basic && tierPrices.premium);
 
   const backendStatusText = useMemo(() => {
     if (!backend.online) return 'Offline';
-    if (!backend.contractReady) return 'Online / Initializing Contract';
-    return 'Online / Ready';
+    if (!backend.contractReady) return 'Initializing…';
+    return 'Ready';
   }, [backend.online, backend.contractReady]);
 
   const themeBackground = theme === 'dark'
     ? 'bg-gradient-to-br from-slate-950 via-blue-950 to-cyan-950'
     : 'bg-gradient-to-br from-amber-50 via-sky-100 to-orange-100';
 
-  const titleText = theme === 'dark' ? 'text-white' : 'text-slate-900';
-  const subtitleText = theme === 'dark' ? 'text-slate-200' : 'text-slate-700';
+  const totalEthSpent = useMemo(() => {
+    const confirmed = transactions.filter((t) => t.status === 'confirmed' && t.amount);
+    const total = confirmed.reduce((sum, t) => {
+      const val = parseFloat(t.amount?.replace(' ETH', '') || '0');
+      return sum + (isNaN(val) ? 0 : val);
+    }, 0);
+    return total.toFixed(4);
+  }, [transactions]);
 
-  const appendTx = (item) => {
-    setTransactions((prev) => mergeTxRecords([item], prev));
-  };
+  const confirmedCount = useMemo(
+    () => transactions.filter((t) => t.status === 'confirmed').length,
+    [transactions]
+  );
+
+  // ─── Tx helpers ──────────────────────────────────────────────────────────────
+  const appendTx = (item) => setTransactions((prev) => mergeTxRecords([item], prev));
 
   const updateTx = (idOrHash, patch) => {
-    setTransactions((prev) => {
-      return prev.map((tx) => {
+    setTransactions((prev) =>
+      prev.map((tx) => {
         const matched = tx.id === idOrHash || tx.hash === idOrHash || tx.clientId === idOrHash;
         return matched ? { ...tx, ...patch } : tx;
-      });
-    });
+      })
+    );
   };
 
+  // ─── Contract builder ────────────────────────────────────────────────────────
   const buildSignerContract = async (nextProvider) => {
+    if (!effectiveContractAddress) {
+      throw new Error('Contract address is unavailable');
+    }
     const signer = await nextProvider.getSigner();
     return new ethers.Contract(effectiveContractAddress, contractABI, signer);
   };
 
+  // ─── Wallet balance ──────────────────────────────────────────────────────────
+  const fetchWalletBalance = async (addr) => {
+    if (!addr || !walletProvider) return;
+    try {
+      const provider = new ethers.BrowserProvider(walletProvider);
+      const bal = await provider.getBalance(addr);
+      setWalletBalance(parseFloat(ethers.formatEther(bal)).toFixed(4));
+    } catch {
+      setWalletBalance(null);
+    }
+  };
+
+  // ─── Backend info ─────────────────────────────────────────────────────────────
   const loadBackendInfo = async (showLoader = false) => {
     try {
       if (showLoader) setRefreshing(true);
 
-      const [healthResponse, statsResponse] = await Promise.allSettled([
+      const [healthRes, statsRes] = await Promise.allSettled([
         api.get('/api/health'),
         api.get('/api/stats')
       ]);
 
-      if (healthResponse.status === 'fulfilled') {
-        const payload = healthResponse.value.data;
+      if (healthRes.status === 'fulfilled') {
+        const p = healthRes.value.data;
         setBackend((prev) => ({
           ...prev,
           online: true,
-          contractReady: Boolean(payload.contractReady),
-          chainId: payload.chainId,
-          startupError: payload.startupError || null,
-          contractAddress: payload.contractAddress || prev.contractAddress
+          contractReady: Boolean(p.contractReady),
+          chainId: p.chainId,
+          startupError: p.startupError || null,
+          contractAddress: p.contractAddress || prev.contractAddress
         }));
       } else {
         setBackend((prev) => ({
           ...prev,
           online: false,
           contractReady: false,
-          startupError: getErrorMessage(healthResponse.reason)
+          startupError: getErrorMessage(healthRes.reason)
         }));
       }
 
-      if (statsResponse.status === 'fulfilled') {
-        const payload = statsResponse.value.data;
-        setTierPrices((prev) => payload.tierPrices || prev);
-        setStats({
-          totalSubscribers: payload.totalSubscribers || 0,
-          activeSubscribers: payload.activeSubscribers || 0,
-          revenue: payload.totalRevenue || '0'
-        });
+      if (statsRes.status === 'fulfilled') {
+        const p = statsRes.value.data;
+        if (p.tierPrices) setTierPrices(p.tierPrices);
+        if (p.contractBalance !== undefined) setContractBalance(p.contractBalance);
         setBackend((prev) => ({
           ...prev,
-          contractAddress: payload.contractAddress || prev.contractAddress,
-          chainId: payload.chainId ?? prev.chainId,
+          contractAddress: p.contractAddress || prev.contractAddress,
+          chainId: p.chainId ?? prev.chainId,
           contractReady: true
         }));
       }
@@ -307,156 +493,142 @@ function App() {
     }
   };
 
-  const fetchSubscriptionStatus = async (selectedAccount = account, showLoader = false) => {
+  // ─── Subscription status ──────────────────────────────────────────────────────
+  const fetchSubscriptionStatus = async (selectedAccount = accountRef.current, showLoader = false) => {
     if (!selectedAccount) return;
-
     try {
       if (showLoader) setStatusLoading(true);
-
       const response = await api.get(`/api/status/${selectedAccount}`);
-      const details = response.data;
-
+      const details  = response.data;
       setSubscriptionStatus({
-        isActive: Boolean(details.isActive),
-        expiry: details.expiry,
-        tier: Number(details.tier),
+        isActive:   Boolean(details.isActive),
+        expiry:     details.expiry,
+        tier:       Number(details.tier),
         expiryDate: details.expiryDate ? formatPreciseDateTime(details.expiryDate) : 'No subscription'
       });
-
-      if (details.tierPrices) {
-        setTierPrices(details.tierPrices);
-      }
-
+      if (details.tierPrices) setTierPrices(details.tierPrices);
       setLastSyncedAt(new Date());
-    } catch (apiError) {
-      if (contract) {
+    } catch {
+      const c = contractRef.current;
+      if (c) {
         try {
-          const details = await contract.getSubscriptionDetails(selectedAccount);
+          const details = await c.getSubscriptionDetails(selectedAccount);
           setSubscriptionStatus({
-            isActive: details.isActive,
-            expiry: details.expiry.toString(),
-            tier: Number(details.tier),
+            isActive:   details.isActive,
+            expiry:     details.expiry.toString(),
+            tier:       Number(details.tier),
             expiryDate: Number(details.expiry) > 0
               ? formatPreciseDateTime(Number(details.expiry) * 1000)
               : 'No subscription'
           });
           setLastSyncedAt(new Date());
-          return;
-        } catch (chainError) {
-          setError(getErrorMessage(chainError));
+        } catch (chainErr) {
+          addToast(getErrorMessage(chainErr), 'error');
+          setSubscriptionStatus({ isActive: false, expiry: '0', tier: 0, expiryDate: 'No subscription' });
         }
       } else {
-        setError(getErrorMessage(apiError));
+        setSubscriptionStatus({ isActive: false, expiry: '0', tier: 0, expiryDate: 'No subscription' });
       }
-
-      setSubscriptionStatus({
-        isActive: false,
-        expiry: '0',
-        tier: 0,
-        expiryDate: 'No subscription'
-      });
     } finally {
       if (showLoader) setStatusLoading(false);
     }
   };
 
+  // ─── Refresh all ─────────────────────────────────────────────────────────────
   const refreshAll = async () => {
-    setError(null);
     await loadBackendInfo(true);
-    if (account) {
-      await fetchSubscriptionStatus(account, true);
-      await syncTransactionsFromBackend(account, true);
+    if (accountRef.current) {
+      await Promise.all([
+        fetchSubscriptionStatus(accountRef.current, true),
+        syncTransactionsFromBackend(accountRef.current, true),
+        fetchWalletBalance(accountRef.current)
+      ]);
     }
+    addToast('Data refreshed', 'success', 2000);
   };
 
-  const syncTransactionsFromBackend = async (selectedAccount = account, showLoader = false) => {
+  // ─── Tx sync ──────────────────────────────────────────────────────────────────
+  const syncTransactionsFromBackend = async (selectedAccount = accountRef.current, showLoader = false) => {
     if (!selectedAccount) return;
-
     try {
       if (showLoader) setTxSyncing(true);
-
       const response = await api.get(`/api/transactions/${selectedAccount}?limit=20`);
-      const backendTx = Array.isArray(response?.data?.transactions)
-        ? response.data.transactions
-        : [];
-
+      const backendTx = Array.isArray(response?.data?.transactions) ? response.data.transactions : [];
       const normalized = backendTx.map((tx) => ({
-        id: tx.id || tx.clientId || tx.hash,
-        clientId: tx.clientId || tx.id || tx.hash,
-        hash: tx.hash || null,
-        type: tx.type || 'Unknown',
-        status: tx.status || 'pending',
-        account: tx.address || selectedAccount,
-        tier: tx.tier || null,
-        amount: tx.amount || null,
+        id:          tx.id || tx.clientId || tx.hash,
+        clientId:    tx.clientId || tx.id || tx.hash,
+        hash:        tx.hash || null,
+        type:        tx.type || 'Unknown',
+        status:      tx.status || 'pending',
+        account:     tx.address || selectedAccount,
+        tier:        tx.tier || null,
+        amount:      tx.amount || null,
         blockNumber: tx.blockNumber || null,
-        error: tx.error || null,
-        timestamp: tx.updatedAt || tx.timestamp || tx.createdAt || new Date().toISOString()
+        error:       tx.error || null,
+        timestamp:   tx.updatedAt || tx.timestamp || tx.createdAt || new Date().toISOString()
       }));
-
       setTransactions((prev) => mergeTxRecords(normalized, prev));
     } catch (err) {
-      console.error('Failed to sync transactions from backend:', err);
+      console.error('Failed to sync transactions:', err);
     } finally {
       if (showLoader) setTxSyncing(false);
     }
   };
 
   const saveTxToBackend = async (payload) => {
-    try {
-      await api.post('/api/transactions', payload);
-    } catch (err) {
-      console.error('Failed to save transaction to backend:', err);
-    }
+    try { await api.post('/api/transactions', payload); } catch {}
   };
 
   const patchTxInBackend = async (idOrHash, payload) => {
     if (!idOrHash) return;
-
-    try {
-      await api.patch(`/api/transactions/${encodeURIComponent(idOrHash)}`, payload);
-    } catch (err) {
-      console.error('Failed to update transaction in backend:', err);
-    }
+    try { await api.patch(`/api/transactions/${encodeURIComponent(idOrHash)}`, payload); } catch {}
   };
 
+  // ─── Connect wallet ───────────────────────────────────────────────────────────
   const connectWallet = async () => {
     try {
       setLoading(true);
-      setError(null);
-      setNotice(null);
+      if (!walletProvider) throw new Error('MetaMask is not installed');
 
-      if (!walletAvailable) {
-        throw new Error('MetaMask is not installed in your browser');
+      const accounts      = await walletProvider.request({ method: 'eth_requestAccounts' });
+      let activeProvider  = new ethers.BrowserProvider(walletProvider);
+      const network       = await activeProvider.getNetwork();
+      let activeChainId   = Number(network.chainId);
+      setChainId(activeChainId);
+
+      if (activeChainId !== EXPECTED_CHAIN_ID) {
+        const switched = await switchToExpectedNetwork(true);
+        if (!switched) {
+          throw new Error(`Wrong network. Please switch MetaMask to chain ID ${EXPECTED_CHAIN_ID}.`);
+        }
+
+        activeProvider = new ethers.BrowserProvider(walletProvider);
+        const refreshedNetwork = await activeProvider.getNetwork();
+        activeChainId = Number(refreshedNetwork.chainId);
+        setChainId(activeChainId);
+
+        if (activeChainId !== EXPECTED_CHAIN_ID) {
+          throw new Error(`Network is still ${activeChainId}. Please switch to chain ID ${EXPECTED_CHAIN_ID}.`);
+        }
       }
 
-      const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
-      const nextProvider = new ethers.BrowserProvider(window.ethereum);
-      const network = await nextProvider.getNetwork();
-      const nextChainId = Number(network.chainId);
-
-      setChainId(nextChainId);
-
-      if (nextChainId !== EXPECTED_CHAIN_ID) {
-        throw new Error(`Wrong network. Please switch MetaMask to chain ID ${EXPECTED_CHAIN_ID}`);
-      }
-
-      const nextContract = await buildSignerContract(nextProvider);
+      const nextContract = await buildSignerContract(activeProvider);
       setContract(nextContract);
       setAccount(accounts[0]);
-      setNotice('Wallet connected successfully');
 
       const [basicPrice, premiumPrice] = await Promise.all([
         nextContract.tierPrices(0),
         nextContract.tierPrices(1)
       ]);
-
       setTierPrices({
-        basic: ethers.formatEther(basicPrice),
+        basic:   ethers.formatEther(basicPrice),
         premium: ethers.formatEther(premiumPrice)
       });
+
+      await fetchWalletBalance(accounts[0]);
+      addToast('Wallet connected successfully', 'success');
     } catch (err) {
-      setError(getErrorMessage(err));
+      addToast(getErrorMessage(err), 'error');
       setContract(null);
       setAccount(null);
     } finally {
@@ -464,222 +636,251 @@ function App() {
     }
   };
 
-  const switchToExpectedNetwork = async () => {
-    if (!walletAvailable) return;
-
+  // ─── Switch network ───────────────────────────────────────────────────────────
+  const switchToExpectedNetwork = async (silent = false) => {
+    if (!walletProvider) return false;
     try {
       setSwitchingNetwork(true);
-      setError(null);
-
-      await window.ethereum.request({
+      await walletProvider.request({
         method: 'wallet_switchEthereumChain',
-        params: [{ chainId: `0x${EXPECTED_CHAIN_ID.toString(16)}` }]
+        params: [{ chainId: EXPECTED_CHAIN_HEX }]
       });
-
-      setNotice(`Switched to chain ${EXPECTED_CHAIN_ID}`);
+      setChainId(EXPECTED_CHAIN_ID);
+      if (!silent) addToast(`Switched to chain ${EXPECTED_CHAIN_ID}`, 'success');
+      return true;
     } catch (err) {
       if (err.code === 4902) {
-        setError('Target chain is not in MetaMask. Add local network (RPC 127.0.0.1:8545, chain 1337).');
+        try {
+          await walletProvider.request({
+            method: 'wallet_addEthereumChain',
+            params: [{
+              chainId: EXPECTED_CHAIN_HEX,
+              chainName: 'Hardhat Localhost',
+              nativeCurrency: {
+                name: 'Ether',
+                symbol: 'ETH',
+                decimals: 18
+              },
+              rpcUrls: ['http://127.0.0.1:8545']
+            }]
+          });
+
+          await walletProvider.request({
+            method: 'wallet_switchEthereumChain',
+            params: [{ chainId: EXPECTED_CHAIN_HEX }]
+          });
+
+          setChainId(EXPECTED_CHAIN_ID);
+          if (!silent) addToast('Local network added and selected', 'success');
+          return true;
+        } catch (addError) {
+          if (!silent) addToast(getErrorMessage(addError), 'error');
+          return false;
+        }
       } else {
-        setError(getErrorMessage(err));
+        if (!silent) addToast(getErrorMessage(err), 'error');
+        return false;
       }
     } finally {
       setSwitchingNetwork(false);
     }
   };
 
+  // ─── Copy address ─────────────────────────────────────────────────────────────
   const copyWalletAddress = async () => {
     if (!account) return;
-
     try {
       await navigator.clipboard.writeText(account);
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
+      addToast('Address copied to clipboard', 'info', 2000);
     } catch {
-      setError('Failed to copy address to clipboard');
+      addToast('Failed to copy address', 'error');
     }
   };
 
+  // ─── Run transaction ──────────────────────────────────────────────────────────
   const runTransaction = async (transactionFn, label, metadata = {}) => {
     const txId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-
     try {
       setLoading(true);
-      setError(null);
-      setNotice(null);
-
-      const tx = await transactionFn();
-      const nowIso = new Date().toISOString();
+      const tx      = await transactionFn();
+      const nowIso  = new Date().toISOString();
 
       const pendingTx = {
-        id: txId,
-        clientId: txId,
-        type: label,
-        status: 'pending',
-        hash: tx.hash,
-        account,
-        tier: metadata.tier || null,
-        amount: metadata.amount || null,
-        timestamp: nowIso
+        id: txId, clientId: txId, type: label, status: 'pending',
+        hash: tx.hash, account, tier: metadata.tier || null,
+        amount: metadata.amount || null, timestamp: nowIso
       };
-
       appendTx(pendingTx);
+      addToast(`${label} submitted — waiting for confirmation…`, 'info', 6000);
+
       await saveTxToBackend({
-        clientId: txId,
-        hash: tx.hash,
-        address: account,
-        type: label,
-        tier: metadata.tier || null,
-        amount: metadata.amount || null,
-        status: 'pending',
-        chainId,
-        timestamp: nowIso
+        clientId: txId, hash: tx.hash, address: account, type: label,
+        tier: metadata.tier || null, amount: metadata.amount || null,
+        status: 'pending', chainId, timestamp: nowIso
       });
 
-      const receipt = await tx.wait();
+      const receipt     = await tx.wait();
       const confirmedAt = new Date().toISOString();
 
-      updateTx(tx.hash || txId, {
-        status: 'confirmed',
-        blockNumber: receipt.blockNumber,
-        timestamp: confirmedAt
-      });
-      await patchTxInBackend(tx.hash || txId, {
-        status: 'confirmed',
-        blockNumber: receipt.blockNumber,
-        timestamp: confirmedAt
-      });
+      updateTx(tx.hash || txId, { status: 'confirmed', blockNumber: receipt.blockNumber, timestamp: confirmedAt });
+      await patchTxInBackend(tx.hash || txId, { status: 'confirmed', blockNumber: receipt.blockNumber, timestamp: confirmedAt });
 
-      await fetchSubscriptionStatus();
-      await loadBackendInfo();
-      await syncTransactionsFromBackend(account);
-      setNotice(`${label} completed successfully`);
+      await Promise.all([
+        fetchSubscriptionStatus(),
+        loadBackendInfo(),
+        syncTransactionsFromBackend(account),
+        fetchWalletBalance(account)
+      ]);
+
+      addToast(`${label} confirmed on block #${receipt.blockNumber}`, 'success');
     } catch (err) {
-      const failedAt = new Date().toISOString();
+      const failedAt  = new Date().toISOString();
       const errorText = getErrorMessage(err);
-
-      updateTx(txId, {
-        status: 'failed',
-        error: errorText,
-        timestamp: failedAt
-      });
-      await patchTxInBackend(txId, {
-        status: 'failed',
-        error: errorText,
-        timestamp: failedAt
-      });
-      await saveTxToBackend({
-        clientId: txId,
-        address: account,
-        type: label,
-        tier: metadata.tier || null,
-        amount: metadata.amount || null,
-        status: 'failed',
-        error: errorText,
-        chainId,
-        timestamp: failedAt
-      });
-
-      setError(errorText);
+      updateTx(txId, { status: 'failed', error: errorText, timestamp: failedAt });
+      await patchTxInBackend(txId, { status: 'failed', error: errorText, timestamp: failedAt });
+      addToast(errorText, 'error', 6000);
     } finally {
       setLoading(false);
     }
   };
 
+  // ─── Action handlers ──────────────────────────────────────────────────────────
   const handleSubscribe = async (tier) => {
     if (!contract) return;
-
     const price = tier === 0 ? tierPrices.basic : tierPrices.premium;
-
-    await runTransaction(async () => {
-      return contract.subscribe(tier, { value: ethers.parseEther(price) });
-    }, 'Subscribe', { tier: getTierLabel(tier), amount: `${price} ETH` });
+    if (!price) {
+      addToast('Live plan price is not available yet. Please refresh.', 'warning');
+      return;
+    }
+    await runTransaction(
+      () => contract.subscribe(tier, { value: ethers.parseEther(price) }),
+      'Subscribe',
+      { tier: getTierLabel(tier), amount: `${price} ETH` }
+    );
   };
 
   const handleRenew = async (tier) => {
     if (!contract) return;
-
     const price = tier === 0 ? tierPrices.basic : tierPrices.premium;
-
-    await runTransaction(async () => {
-      return contract.renew(tier, { value: ethers.parseEther(price) });
-    }, 'Renew', { tier: getTierLabel(tier), amount: `${price} ETH` });
+    if (!price) {
+      addToast('Live plan price is not available yet. Please refresh.', 'warning');
+      return;
+    }
+    await runTransaction(
+      () => contract.renew(tier, { value: ethers.parseEther(price) }),
+      'Renew',
+      { tier: getTierLabel(tier), amount: `${price} ETH` }
+    );
   };
 
   const handleUnsubscribe = async () => {
     if (!contract) return;
-
-    await runTransaction(async () => {
-      return contract.unsubscribe();
-    }, 'Unsubscribe', { tier: null, amount: null });
+    await runTransaction(() => contract.unsubscribe(), 'Unsubscribe', {});
   };
 
   const clearTxHistory = () => {
     setTransactions([]);
-    setNotice('Transaction history cleared');
+    addToast('Transaction history cleared', 'info', 2000);
   };
 
-  useEffect(() => {
-    localStorage.setItem(THEME_STORAGE_KEY, theme);
-  }, [theme]);
+  const syncWalletProvider = useCallback((notify = false) => {
+    const detected = detectEthereumProvider();
+    if (!detected) {
+      if (notify) {
+        addToast('MetaMask not detected yet. Make sure the extension is installed and unlocked, then refresh.', 'warning');
+      }
+      return false;
+    }
+    setWalletProvider((prev) => (prev === detected ? prev : detected));
+    if (notify) addToast('Wallet detected. You can connect now.', 'success');
+    return true;
+  }, [addToast]);
 
-  useEffect(() => {
-    localStorage.setItem(TX_HISTORY_STORAGE_KEY, JSON.stringify(transactions));
-  }, [transactions]);
+  // ─── Effects ──────────────────────────────────────────────────────────────────
+  useEffect(() => { localStorage.setItem(THEME_STORAGE_KEY, theme); }, [theme]);
+  useEffect(() => { localStorage.setItem(TX_HISTORY_STORAGE_KEY, JSON.stringify(transactions)); }, [transactions]);
 
+  // Detect wallet providers (supports async injection on some browsers/mobile)
+  useEffect(() => {
+    if (typeof window === 'undefined') return undefined;
+
+    let intervalId = null;
+    let timeoutId = null;
+    const onEthereumInitialized = () => { syncWalletProvider(); };
+
+    window.addEventListener('ethereum#initialized', onEthereumInitialized, { once: true });
+
+    if (!syncWalletProvider()) {
+      intervalId = window.setInterval(() => {
+        if (syncWalletProvider() && intervalId) {
+          window.clearInterval(intervalId);
+          intervalId = null;
+        }
+      }, 300);
+      timeoutId = window.setTimeout(() => {
+        if (intervalId) {
+          window.clearInterval(intervalId);
+          intervalId = null;
+        }
+      }, 5000);
+    }
+
+    return () => {
+      window.removeEventListener('ethereum#initialized', onEthereumInitialized);
+      if (intervalId) window.clearInterval(intervalId);
+      if (timeoutId) window.clearTimeout(timeoutId);
+    };
+  }, [syncWalletProvider]);
+
+  // Initial load + wallet listeners
   useEffect(() => {
     loadBackendInfo();
+    if (!walletProvider) return undefined;
 
-    if (!walletAvailable) return undefined;
+    const nextProvider = new ethers.BrowserProvider(walletProvider);
 
-    const nextProvider = new ethers.BrowserProvider(window.ethereum);
-
-    window.ethereum.request({ method: 'eth_accounts' }).then(async (accounts) => {
+    walletProvider.request({ method: 'eth_accounts' }).then(async (accounts) => {
       const network = await nextProvider.getNetwork();
       setChainId(Number(network.chainId));
-
       if (accounts.length > 0) {
         try {
           const nextContract = await buildSignerContract(nextProvider);
           setContract(nextContract);
           setAccount(accounts[0]);
+          fetchWalletBalance(accounts[0]);
         } catch {
           setContract(null);
           setAccount(null);
         }
       }
-    }).catch(() => {
-      setAccount(null);
-    });
+    }).catch(() => setAccount(null));
 
     const onAccountsChanged = (accounts) => {
       if (accounts.length === 0) {
-        setAccount(null);
-        setContract(null);
-        setSubscriptionStatus(null);
-        setNotice('Wallet disconnected');
+        setAccount(null); setContract(null);
+        setSubscriptionStatus(null); setWalletBalance(null);
+        addToast('Wallet disconnected', 'warning');
         return;
       }
-
       setAccount(accounts[0]);
-      setNotice('Wallet account changed');
+      addToast('Account changed', 'info');
     };
 
-    const onChainChanged = () => {
-      window.location.reload();
-    };
+    const onChainChanged = () => window.location.reload();
 
-    window.ethereum.on('accountsChanged', onAccountsChanged);
-    window.ethereum.on('chainChanged', onChainChanged);
-
+    walletProvider.on('accountsChanged', onAccountsChanged);
+    walletProvider.on('chainChanged', onChainChanged);
     return () => {
-      if (window.ethereum.removeListener) {
-        window.ethereum.removeListener('accountsChanged', onAccountsChanged);
-        window.ethereum.removeListener('chainChanged', onChainChanged);
+      if (walletProvider.removeListener) {
+        walletProvider.removeListener('accountsChanged', onAccountsChanged);
+        walletProvider.removeListener('chainChanged', onChainChanged);
       }
     };
-  }, []);
+  }, [walletProvider]);
 
+  // Load data when account/contract changes
   useEffect(() => {
     if (account) {
       fetchSubscriptionStatus(account, true);
@@ -687,70 +888,82 @@ function App() {
     }
   }, [account, contract]);
 
+  // Countdown timer
   useEffect(() => {
-    if (!subscriptionStatus?.isActive) {
-      setCountdown(null);
-      return undefined;
-    }
-
+    if (!subscriptionStatus?.isActive) { setCountdown(null); return; }
     setCountdown(formatCountdown(subscriptionStatus.expiry));
-
-    const timer = setInterval(() => {
-      setCountdown(formatCountdown(subscriptionStatus.expiry));
-    }, 1000);
-
+    const timer = setInterval(() => setCountdown(formatCountdown(subscriptionStatus.expiry)), 1000);
     return () => clearInterval(timer);
   }, [subscriptionStatus]);
 
+  // Auto-refresh every 20 s
   useEffect(() => {
-    if (!account) return undefined;
-
+    if (!account) return;
     const interval = setInterval(async () => {
       await loadBackendInfo();
-      await fetchSubscriptionStatus(account);
-      await syncTransactionsFromBackend(account);
+      await fetchSubscriptionStatus(accountRef.current);
+      await syncTransactionsFromBackend(accountRef.current);
     }, 20000);
-
     return () => clearInterval(interval);
-  }, [account, contract]);
+  }, [account]);
 
+  // Clock
   useEffect(() => {
-    const clock = setInterval(() => {
-      setNow(new Date());
-    }, 1000);
-
+    const clock = setInterval(() => setNow(new Date()), 1000);
     return () => clearInterval(clock);
   }, []);
 
+  // ─── Render ───────────────────────────────────────────────────────────────────
   return (
     <div className={`min-h-screen p-4 transition-colors duration-300 ${themeBackground}`}>
-      <div className="max-w-6xl mx-auto">
-        <div className="fixed inset-0 overflow-hidden pointer-events-none">
-          <div className="absolute -top-40 -right-40 w-80 h-80 bg-cyan-500 rounded-full mix-blend-screen filter blur-xl opacity-20 animate-pulse"></div>
-          <div className="absolute -bottom-40 -left-40 w-80 h-80 bg-orange-500 rounded-full mix-blend-screen filter blur-xl opacity-20 animate-pulse animation-delay-2000"></div>
-          <div className="absolute top-1/3 left-1/2 transform -translate-x-1/2 -translate-y-1/2 w-72 h-72 bg-blue-500 rounded-full mix-blend-screen filter blur-xl opacity-20 animate-pulse animation-delay-4000"></div>
-        </div>
+      {/* Toast notifications */}
+      <ToastContainer toasts={toasts} onRemove={removeToast} />
 
-        <header className="text-center mb-10 relative z-10">
-          <div className="flex justify-end mb-4">
+      {/* Background blobs */}
+      <div className="fixed inset-0 overflow-hidden pointer-events-none">
+        <div className="absolute -top-40 -right-40 w-96 h-96 bg-cyan-500 rounded-full mix-blend-screen filter blur-3xl opacity-20 animate-pulse" />
+        <div className="absolute -bottom-40 -left-40 w-96 h-96 bg-orange-500 rounded-full mix-blend-screen filter blur-3xl opacity-20 animate-pulse animation-delay-2000" />
+        <div className="absolute top-1/3 left-1/2 -translate-x-1/2 -translate-y-1/2 w-80 h-80 bg-blue-500 rounded-full mix-blend-screen filter blur-3xl opacity-15 animate-pulse animation-delay-4000" />
+      </div>
+
+      <div className="max-w-6xl mx-auto relative z-10">
+
+        {/* ── Header ─────────────────────────────────────────────────────────── */}
+        <header className="text-center mb-10">
+          <div className="flex items-center justify-between mb-6">
+            {/* Network badge */}
+            <div className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-semibold border
+              ${networkMatches
+                ? 'bg-emerald-500/20 border-emerald-500/40 text-emerald-300'
+                : 'bg-amber-500/20 border-amber-500/40 text-amber-300'}`}>
+              <span className={`w-2 h-2 rounded-full ${networkMatches ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'}`} />
+              Chain {chainId ?? '—'}
+            </div>
+
+            <h1 className="text-3xl sm:text-4xl font-extrabold bg-clip-text text-transparent bg-gradient-to-r from-cyan-300 via-blue-300 to-orange-300">
+              SubChain
+            </h1>
+
             <button
-              onClick={() => setTheme((prev) => (prev === 'dark' ? 'light' : 'dark'))}
+              onClick={() => setTheme((p) => (p === 'dark' ? 'light' : 'dark'))}
               className="theme-toggle-btn"
+              aria-label="Toggle theme"
             >
-              {theme === 'dark' ? 'Light Theme' : 'Dark Theme'}
+              {theme === 'dark' ? '☀ Light' : '🌙 Dark'}
             </button>
           </div>
 
-          <h1 className={`text-4xl sm:text-5xl font-bold mb-3 bg-clip-text text-transparent bg-gradient-to-r from-cyan-300 via-blue-300 to-orange-300 ${titleText}`}>
-            Subscription DApp
-          </h1>
-          <p className={`text-base sm:text-lg ${subtitleText}`}>Secure on-chain membership with live backend sync</p>
+          <p className={`text-base sm:text-lg mb-8 ${theme === 'dark' ? 'text-slate-300' : 'text-slate-600'}`}>
+            Decentralised subscription management — powered by Ethereum
+          </p>
 
-          <div className="mt-6 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3 max-w-6xl mx-auto">
-            <div className="status-tile cursor-pointer hover:bg-white/20 transition-all" onClick={() => setShowStatsPanel(!showStatsPanel)}>
+          {/* Status tiles */}
+          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
+            <div className="status-tile">
               <p className="status-label">Backend</p>
-              <p className={`status-value ${!backend.online ? 'text-red-300' : backend.contractReady ? 'text-emerald-300' : 'text-amber-300'}`}>{backendStatusText}</p>
-              <p className="text-[10px] text-slate-400 mt-1">Click for stats</p>
+              <p className={`status-value ${!backend.online ? 'text-red-300' : backend.contractReady ? 'text-emerald-300' : 'text-amber-300'}`}>
+                {backendStatusText}
+              </p>
             </div>
             <div className="status-tile">
               <p className="status-label">Contract</p>
@@ -759,510 +972,498 @@ function App() {
               </p>
             </div>
             <div className="status-tile">
-              <p className="status-label">Wallet Network</p>
+              <p className="status-label">Network</p>
               <p className={`status-value ${networkMatches ? 'text-white' : 'text-amber-300'}`}>
-                {chainId ?? '-'} / {EXPECTED_CHAIN_ID}
+                {chainId ?? '—'} / {EXPECTED_CHAIN_ID}
               </p>
             </div>
             <div className="status-tile">
               <p className="status-label">Last Sync</p>
-              <p className="status-value text-white">{formatPreciseDateTime(lastSyncedAt)}</p>
+              <p className="status-value text-white text-xs">{formatPreciseDateTime(lastSyncedAt)}</p>
             </div>
             <div className="status-tile">
-              <p className="status-label">Current Time</p>
+              <p className="status-label">Local Time</p>
               <p className="status-value text-white">{formatPreciseTime(now)}</p>
-              <p className="text-[11px] text-slate-300 mt-1">{timeZoneLabel}</p>
+              <p className="text-[10px] text-slate-400 mt-0.5">{timeZoneLabel}</p>
             </div>
           </div>
-
-          {showStatsPanel && backend.contractReady && (
-            <div className="mt-4 grid grid-cols-1 sm:grid-cols-3 gap-3 max-w-4xl mx-auto">
-              <div className="stats-card">
-                <div className="stats-icon bg-blue-500">
-                  <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z" />
-                  </svg>
-                </div>
-                <div>
-                  <p className="stats-label">Active Subscribers</p>
-                  <p className="stats-value">{stats.activeSubscribers}</p>
-                </div>
-              </div>
-              <div className="stats-card">
-                <div className="stats-icon bg-emerald-500">
-                  <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                  </svg>
-                </div>
-                <div>
-                  <p className="stats-label">Total Revenue</p>
-                  <p className="stats-value">{parseFloat(stats.revenue).toFixed(4)} ETH</p>
-                </div>
-              </div>
-              <div className="stats-card">
-                <div className="stats-icon bg-purple-500">
-                  <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
-                  </svg>
-                </div>
-                <div>
-                  <p className="stats-label">Total Subscribers</p>
-                  <p className="stats-value">{stats.totalSubscribers}</p>
-                </div>
-              </div>
-            </div>
-          )}
         </header>
 
-        {error && <div className="alert-box alert-error">{error}</div>}
-        {notice && <div className="alert-box alert-success">{notice}</div>}
-
+        {/* ── Network warning ─────────────────────────────────────────────────── */}
         {!networkMatches && (
-          <div className="alert-box alert-warning">
-            Wallet is on a different network. Switch to chain ID {EXPECTED_CHAIN_ID}.
-          </div>
-        )}
-
-        <div className="grid lg:grid-cols-3 gap-6 mb-8">
-          <div className="card lg:col-span-1">
-            <h2 className="text-2xl font-bold text-slate-800 mb-1">Wallet</h2>
-            <p className="text-sm text-slate-500 mb-5">Connect and manage your session</p>
-
-            {!account ? (
-              <div className="space-y-3">
-                <button
-                  onClick={connectWallet}
-                  disabled={loading || !walletAvailable}
-                  className="wallet-connect-btn w-full"
-                >
-                  {loading ? 'Connecting...' : walletAvailable ? 'Connect MetaMask' : 'MetaMask Not Installed'}
-                </button>
-              </div>
-            ) : (
-              <div className="space-y-3">
-                <div className="bg-emerald-50 border border-emerald-200 rounded-lg p-4">
-                  <p className="text-xs text-emerald-700 font-semibold mb-1">CONNECTED ACCOUNT</p>
-                  <p className="font-mono text-xs sm:text-sm text-slate-700 break-all">{account}</p>
-                </div>
-
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                  <button onClick={copyWalletAddress} className="secondary-action-btn">
-                    {copied ? 'Copied' : `Copy ${shortenAddress(account)}`}
-                  </button>
-                  <button onClick={refreshAll} disabled={refreshing} className="secondary-action-btn">
-                    {refreshing ? 'Refreshing...' : 'Refresh Data'}
-                  </button>
-                </div>
-
-                {!networkMatches && (
-                  <button
-                    onClick={switchToExpectedNetwork}
-                    disabled={switchingNetwork}
-                    className="secondary-action-btn border-amber-400 text-amber-700 hover:bg-amber-50"
-                  >
-                    {switchingNetwork ? 'Switching...' : `Switch Network (${EXPECTED_CHAIN_ID})`}
-                  </button>
-                )}
-
-                <div className="text-xs text-slate-500 bg-slate-100 p-3 rounded-lg">
-                  Contract: <span className="font-mono">{effectiveContractAddress}</span>
-                </div>
-              </div>
-            )}
-          </div>
-
-          <div className="card lg:col-span-2">
-            <h2 className="text-2xl font-bold text-slate-800 mb-1">Subscription Status</h2>
-            <p className="text-sm text-slate-500 mb-5">Live status from backend and blockchain</p>
-
-            {statusLoading || initialLoadPending ? (
-              <div className="space-y-3">
-                <div className="skeleton h-6 w-48"></div>
-                <div className="skeleton h-20 w-full"></div>
-                <div className="skeleton h-20 w-full"></div>
-              </div>
-            ) : !account ? (
-              <div className="empty-state">Connect wallet to load your subscription details.</div>
-            ) : (
-              <div className="grid md:grid-cols-2 gap-6">
-                <div className="space-y-4">
-                  <div className={`inline-flex items-center px-4 py-2 rounded-full text-sm font-semibold ${subscriptionStatus?.isActive ? 'bg-emerald-100 text-emerald-800 border border-emerald-200 pulse-glow' : 'bg-rose-100 text-rose-800 border border-rose-200'}`}>
-                    <span className={`w-2 h-2 rounded-full mr-2 ${subscriptionStatus?.isActive ? 'bg-emerald-500 animate-pulse' : 'bg-rose-500'}`}></span>
-                    {subscriptionStatus?.isActive ? 'Active Subscription' : 'No Active Subscription'}
-                  </div>
-
-                  {subscriptionStatus?.isActive ? (
-                    <>
-                      <div className="info-panel bg-gradient-to-br from-blue-50 to-cyan-50 border-blue-200">
-                        <p className="panel-label text-blue-700">Current Tier</p>
-                        <div className="flex items-center justify-between">
-                          <p className="panel-value text-blue-900">{subscriptionStatus.tier === 1 ? '⭐ Premium' : '📦 Basic'}</p>
-                          {subscriptionStatus.tier === 1 && (
-                            <span className="text-xs bg-orange-100 text-orange-700 px-2 py-1 rounded-full font-semibold">VIP</span>
-                          )}
-                        </div>
-                      </div>
-                      <div className="info-panel bg-gradient-to-br from-purple-50 to-pink-50 border-purple-200">
-                        <p className="panel-label text-purple-700">Expires On</p>
-                        <p className="panel-value text-purple-900">{subscriptionStatus.expiryDate}</p>
-                        {subscriptionStatus.expiry && Number(subscriptionStatus.expiry) > 0 && (
-                          <p className="text-xs text-purple-600 mt-1">
-                            {Math.ceil((Number(subscriptionStatus.expiry) - Math.floor(Date.now() / 1000)) / (24 * 60 * 60))} days remaining
-                          </p>
-                        )}
-                      </div>
-                      <button
-                        onClick={() => setShowUnsubscribeConfirm(true)}
-                        disabled={loading}
-                        className="w-full bg-gradient-to-r from-red-600 to-rose-600 hover:from-red-700 hover:to-rose-700 text-white font-semibold py-3 px-4 rounded-lg transition duration-200 transform hover:scale-105"
-                      >
-                        Cancel Subscription
-                      </button>
-                    </>
-                  ) : (
-                    <div className="empty-state">
-                      <svg className="w-16 h-16 mx-auto mb-3 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
-                      </svg>
-                      <p className="text-slate-600 font-semibold mb-1">No Active Subscription</p>
-                      <p className="text-sm text-slate-500">Subscribe to activate your plan and start enjoying benefits</p>
-                    </div>
-                  )}
-                </div>
-
-                <div>
-                  {subscriptionStatus?.isActive && countdown ? (
-                    <div className="bg-gradient-to-br from-cyan-600 via-blue-700 to-purple-700 rounded-xl p-6 text-white shadow-xl relative overflow-hidden">
-                      <div className="absolute top-0 right-0 w-32 h-32 bg-white/10 rounded-full -mr-16 -mt-16"></div>
-                      <div className="absolute bottom-0 left-0 w-24 h-24 bg-white/10 rounded-full -ml-12 -mb-12"></div>
-                      <div className="relative z-10">
-                        <p className="font-semibold mb-2 flex items-center">
-                          <svg className="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
-                          </svg>
-                          Time Remaining
-                        </p>
-                        <p className="text-4xl font-bold mb-1">{countdown}</p>
-                        <p className="text-sm text-cyan-100">Auto-refresh every 20 seconds</p>
-                        <div className="mt-4 pt-4 border-t border-white/20">
-                          <p className="text-xs text-cyan-200 mb-1">Subscription Benefits</p>
-                          <div className="flex items-center text-sm">
-                            <svg className="w-4 h-4 mr-1" fill="currentColor" viewBox="0 0 20 20">
-                              <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
-                            </svg>
-                            Full access to all features
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="empty-state h-full flex flex-col items-center justify-center">
-                      <svg className="w-20 h-20 text-slate-300 mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
-                      </svg>
-                      <p className="text-slate-600 font-semibold">No Active Timer</p>
-                      <p className="text-sm text-slate-500 mt-1">Countdown appears when subscription is active</p>
-                    </div>
-                  )}
-                </div>
-              </div>
-            )}
-          </div>
-        </div>
-
-        {account && (
-          <div className="card mb-8">
-            <h2 className="text-3xl font-bold text-slate-800 mb-2 text-center">Choose Your Plan</h2>
-            <p className="text-slate-500 text-center mb-8">Pick a tier and confirm in MetaMask</p>
-
-            {(initialLoadPending || statusLoading) ? (
-              <div className="grid md:grid-cols-2 gap-8">
-                <div className="skeleton h-64 w-full"></div>
-                <div className="skeleton h-64 w-full"></div>
-              </div>
-            ) : (
-              <div className="grid md:grid-cols-2 gap-8">
-                <div className="plan-card border-cyan-200 hover:border-cyan-400 hover:shadow-xl transition-all">
-                  <div className="plan-header">
-                    <h3 className="text-2xl font-bold text-slate-800">Basic</h3>
-                    <span className="plan-pill bg-cyan-100 text-cyan-700">Starter</span>
-                  </div>
-                  <p className="text-slate-500 mb-4">Great for first-time users</p>
-                  <p className="text-4xl font-bold text-slate-900 mb-2">
-                    {tierPrices.basic}<span className="text-lg text-slate-500 ml-2">ETH</span>
-                  </p>
-                  <p className="text-xs text-slate-400 mb-6">30 days access</p>
-                  
-                  <ul className="space-y-2 mb-6">
-                    <li className="flex items-center text-sm text-slate-600">
-                      <svg className="w-5 h-5 text-cyan-500 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-                      </svg>
-                      Standard features
-                    </li>
-                    <li className="flex items-center text-sm text-slate-600">
-                      <svg className="w-5 h-5 text-cyan-500 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-                      </svg>
-                      Email support
-                    </li>
-                    <li className="flex items-center text-sm text-slate-600">
-                      <svg className="w-5 h-5 text-cyan-500 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-                      </svg>
-                      Basic analytics
-                    </li>
-                  </ul>
-
-                  {!subscriptionStatus?.isActive ? (
-                    <button
-                      onClick={() => handleSubscribe(0)}
-                      disabled={loading || !networkMatches || !backend.contractReady}
-                      className="subscribe-btn w-full"
-                    >
-                      {loading ? 'Processing...' : 'Subscribe Basic'}
-                    </button>
-                  ) : (
-                    <button
-                      onClick={() => handleRenew(0)}
-                      disabled={loading || !networkMatches || !backend.contractReady}
-                      className="renew-btn w-full"
-                    >
-                      {loading ? 'Processing...' : 'Renew Basic'}
-                    </button>
-                  )}
-                </div>
-
-                <div className="plan-card border-orange-200 hover:border-orange-400 hover:shadow-xl transition-all relative overflow-hidden">
-                  <div className="absolute top-0 right-0 bg-gradient-to-br from-orange-500 to-rose-500 text-white text-xs font-bold px-3 py-1 rounded-bl-lg">
-                    BEST VALUE
-                  </div>
-                  <div className="plan-header">
-                    <h3 className="text-2xl font-bold text-slate-800">Premium</h3>
-                    <span className="plan-pill bg-orange-100 text-orange-700">Popular</span>
-                  </div>
-                  <p className="text-slate-500 mb-4">Priority and full access tier</p>
-                  <p className="text-4xl font-bold text-slate-900 mb-2">
-                    {tierPrices.premium}<span className="text-lg text-slate-500 ml-2">ETH</span>
-                  </p>
-                  <p className="text-xs text-slate-400 mb-6">30 days access</p>
-                  
-                  <ul className="space-y-2 mb-6">
-                    <li className="flex items-center text-sm text-slate-600">
-                      <svg className="w-5 h-5 text-orange-500 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-                      </svg>
-                      All Basic features
-                    </li>
-                    <li className="flex items-center text-sm text-slate-600">
-                      <svg className="w-5 h-5 text-orange-500 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-                      </svg>
-                      Priority support 24/7
-                    </li>
-                    <li className="flex items-center text-sm text-slate-600">
-                      <svg className="w-5 h-5 text-orange-500 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-                      </svg>
-                      Advanced analytics
-                    </li>
-                    <li className="flex items-center text-sm text-slate-600">
-                      <svg className="w-5 h-5 text-orange-500 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-                      </svg>
-                      Exclusive features
-                    </li>
-                  </ul>
-
-                  {!subscriptionStatus?.isActive ? (
-                    <button
-                      onClick={() => handleSubscribe(1)}
-                      disabled={loading || !networkMatches || !backend.contractReady}
-                      className="subscribe-btn w-full bg-gradient-to-r from-orange-500 to-rose-500 hover:from-orange-600 hover:to-rose-600"
-                    >
-                      {loading ? 'Processing...' : 'Subscribe Premium'}
-                    </button>
-                  ) : (
-                    <button
-                      onClick={() => handleRenew(1)}
-                      disabled={loading || !networkMatches || !backend.contractReady}
-                      className="renew-btn w-full bg-gradient-to-r from-orange-500 to-rose-500 hover:from-orange-600 hover:to-rose-600"
-                    >
-                      {loading ? 'Processing...' : 'Renew Premium'}
-                    </button>
-                  )}
-                </div>
-              </div>
-            )}
-          </div>
-        )}
-
-        <div className="card mb-8">
-          <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between mb-5 gap-4">
-            <div>
-              <h2 className="text-2xl font-bold text-slate-800">Transaction History</h2>
-              <p className="text-sm text-slate-500">Latest 20 local transactions • {filteredTransactions.length} shown</p>
-            </div>
-            <button onClick={clearTxHistory} className="secondary-action-btn w-auto px-4 py-2">
-              Clear All
+          <div className="alert-box alert-warning flex items-center justify-between">
+            <span>⚠ Wallet is on a different network. Switch to chain ID {EXPECTED_CHAIN_ID}.</span>
+            <button
+              onClick={switchToExpectedNetwork}
+              disabled={switchingNetwork}
+              className="ml-4 px-3 py-1.5 bg-amber-500 hover:bg-amber-600 text-white text-xs font-bold rounded-lg transition"
+            >
+              {switchingNetwork ? 'Switching…' : 'Switch Now'}
             </button>
           </div>
+        )}
 
-          <div className="flex flex-col sm:flex-row gap-3 mb-5">
-            <div className="flex-1">
-              <input
-                type="text"
-                placeholder="Search by type, hash, tier, or amount..."
-                value={txSearch}
-                onChange={(e) => setTxSearch(e.target.value)}
-                className="w-full px-4 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
-              />
-            </div>
-            <div className="flex gap-2">
-              <button
-                onClick={() => setTxFilter('all')}
-                className={`px-4 py-2 rounded-lg font-semibold text-sm transition ${txFilter === 'all' ? 'bg-cyan-600 text-white' : 'bg-slate-200 text-slate-700 hover:bg-slate-300'}`}
-              >
-                All
-              </button>
-              <button
-                onClick={() => setTxFilter('confirmed')}
-                className={`px-4 py-2 rounded-lg font-semibold text-sm transition ${txFilter === 'confirmed' ? 'bg-emerald-600 text-white' : 'bg-slate-200 text-slate-700 hover:bg-slate-300'}`}
-              >
-                Confirmed
-              </button>
-              <button
-                onClick={() => setTxFilter('pending')}
-                className={`px-4 py-2 rounded-lg font-semibold text-sm transition ${txFilter === 'pending' ? 'bg-amber-600 text-white' : 'bg-slate-200 text-slate-700 hover:bg-slate-300'}`}
-              >
-                Pending
-              </button>
-              <button
-                onClick={() => setTxFilter('failed')}
-                className={`px-4 py-2 rounded-lg font-semibold text-sm transition ${txFilter === 'failed' ? 'bg-rose-600 text-white' : 'bg-slate-200 text-slate-700 hover:bg-slate-300'}`}
-              >
-                Failed
-              </button>
-            </div>
+        {/* ── Stats row (only when wallet connected) ──────────────────────────── */}
+        {account && (
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-8">
+            <StatCard
+              icon={<StatusBadge isActive={subscriptionStatus?.isActive} />}
+              label="Subscription"
+              value={subscriptionStatus?.isActive ? getTierLabel(subscriptionStatus.tier) : 'None'}
+              iconBg="bg-transparent"
+            />
+            <StatCard
+              icon={<span className="text-2xl">⏱</span>}
+              label="Time Left"
+              value={countdown || '—'}
+              iconBg="bg-blue-600"
+            />
+            <StatCard
+              icon={<span className="text-2xl">💎</span>}
+              label="ETH Spent"
+              value={`${totalEthSpent} ETH`}
+              sub={`${confirmedCount} confirmed tx`}
+              iconBg="bg-purple-600"
+            />
+            <StatCard
+              icon={<span className="text-2xl">👛</span>}
+              label="Wallet Balance"
+              value={walletBalance !== null ? `${walletBalance} ETH` : '—'}
+              iconBg="bg-cyan-700"
+            />
           </div>
+        )}
 
-          {(txSyncing && transactions.length === 0) ? (
-            <div className="space-y-3">
-              <div className="skeleton h-16 w-full"></div>
-              <div className="skeleton h-16 w-full"></div>
-              <div className="skeleton h-16 w-full"></div>
-            </div>
-          ) : filteredTransactions.length === 0 ? (
-            <div className="empty-state">
-              {txSearch || txFilter !== 'all' ? (
-                <>
-                  <svg className="w-16 h-16 mx-auto mb-3 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
-                  </svg>
-                  <p className="text-slate-600 font-semibold">No matching transactions</p>
-                  <p className="text-sm text-slate-500 mt-1">Try adjusting your filters or search term</p>
-                </>
-              ) : (
-                <>
-                  <svg className="w-16 h-16 mx-auto mb-3 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                  </svg>
-                  <p className="text-slate-600 font-semibold">No transactions yet</p>
-                  <p className="text-sm text-slate-500 mt-1">Make a subscription action to see records here</p>
-                </>
-              )}
-            </div>
-          ) : (
-            <div className="space-y-3">
-              {filteredTransactions.map((tx) => (
-                <div key={tx.id} className="tx-row hover:shadow-md transition-shadow">
-                  <div className="flex-1">
-                    <div className="flex items-center gap-2 mb-1">
-                      <p className="tx-title">{tx.type}</p>
-                      {tx.tier && (
-                        <span className="text-xs bg-blue-100 text-blue-700 px-2 py-0.5 rounded-full font-semibold">
-                          {tx.tier}
-                        </span>
+        {/* ── Tab navigation ───────────────────────────────────────────────────── */}
+        <div className="flex gap-2 mb-6">
+          {['dashboard', 'history'].map((tab) => (
+            <button
+              key={tab}
+              onClick={() => setActiveTab(tab)}
+              className={`px-5 py-2 rounded-xl text-sm font-semibold transition-all duration-200
+                ${activeTab === tab
+                  ? 'bg-white text-slate-900 shadow-md'
+                  : 'bg-white/10 text-white hover:bg-white/20'}`}
+            >
+              {tab === 'dashboard' ? '📊 Dashboard' : '📋 History'}
+            </button>
+          ))}
+        </div>
+
+        {/* ══════════════════════════════════════════════════════════════════════ */}
+        {/* DASHBOARD TAB                                                         */}
+        {/* ══════════════════════════════════════════════════════════════════════ */}
+        {activeTab === 'dashboard' && (
+          <>
+            {/* ── Wallet + Status row ─────────────────────────────────────────── */}
+            <div className="grid lg:grid-cols-3 gap-6 mb-8">
+
+              {/* Wallet card */}
+              <div className="card lg:col-span-1">
+                <div className="flex items-center gap-2 mb-1">
+                  <WalletIcon />
+                  <h2 className="text-xl font-bold text-slate-800">Wallet</h2>
+                </div>
+                <p className="text-sm text-slate-500 mb-5">Connect and manage your session</p>
+
+                {!account ? (
+                  <div className="space-y-2">
+                    <button
+                      onClick={connectWallet}
+                      disabled={loading || !walletAvailable}
+                      className="wallet-connect-btn w-full"
+                    >
+                      <WalletIcon />
+                      {loading ? 'Connecting…' : walletAvailable ? 'Connect MetaMask' : 'MetaMask Not Found'}
+                    </button>
+                    {!walletAvailable && (
+                      <button
+                        onClick={() => syncWalletProvider(true)}
+                        className="secondary-action-btn w-full"
+                      >
+                        Retry Wallet Detection
+                      </button>
+                    )}
+                  </div>
+                ) : (
+                  <div className="space-y-3">
+                    <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-4">
+                      <p className="text-xs text-emerald-700 font-bold mb-1 uppercase tracking-wide">Connected</p>
+                      <p className="font-mono text-xs text-slate-700 break-all">{account}</p>
+                      {walletBalance !== null && (
+                        <p className="text-xs text-slate-500 mt-1">Balance: <span className="font-semibold text-slate-700">{walletBalance} ETH</span></p>
                       )}
                     </div>
-                    <p className="tx-meta">
-                      {tx.amount && <span className="font-semibold text-slate-700">{tx.amount}</span>}
-                      {tx.amount && ' • '}
-                      {tx.timestamp ? formatPreciseDateTime(tx.timestamp) : 'Unknown time'}
-                    </p>
-                    <p className="tx-meta font-mono flex items-center gap-2">
-                      {tx.hash ? (
+
+                    <div className="grid grid-cols-2 gap-2">
+                      <button onClick={copyWalletAddress} className="secondary-action-btn flex items-center justify-center gap-1.5">
+                        <CopyIcon />
+                        {copied ? 'Copied!' : shortenAddress(account)}
+                      </button>
+                      <button onClick={refreshAll} disabled={refreshing} className="secondary-action-btn flex items-center justify-center gap-1.5">
+                        <RefreshIcon spinning={refreshing} />
+                        {refreshing ? 'Refreshing…' : 'Refresh'}
+                      </button>
+                    </div>
+
+                    <div className="text-xs text-slate-500 bg-slate-100 p-3 rounded-lg break-all">
+                      <span className="font-semibold">Contract:</span>{' '}
+                      <span className="font-mono">{effectiveContractAddress ? shortenAddress(effectiveContractAddress) : 'Unavailable'}</span>
+                    </div>
+
+                    {contractBalance !== null && (
+                      <div className="text-xs text-slate-500 bg-slate-100 p-3 rounded-lg">
+                        <span className="font-semibold">Contract Balance:</span>{' '}
+                        <span className="font-mono text-slate-700">{contractBalance} ETH</span>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {/* Subscription status card */}
+              <div className="card lg:col-span-2">
+                <div className="flex items-center justify-between mb-1">
+                  <div className="flex items-center gap-2">
+                    <ShieldIcon />
+                    <h2 className="text-xl font-bold text-slate-800">Subscription Status</h2>
+                  </div>
+                  {subscriptionStatus && <StatusBadge isActive={subscriptionStatus.isActive} />}
+                </div>
+                <p className="text-sm text-slate-500 mb-5">Live status from backend and blockchain</p>
+
+                {statusLoading || initialLoadPending ? (
+                  <div className="space-y-3">
+                    <div className="skeleton h-6 w-48" />
+                    <div className="skeleton h-20 w-full" />
+                    <div className="skeleton h-20 w-full" />
+                  </div>
+                ) : !account ? (
+                  <div className="empty-state">Connect your wallet to view subscription details.</div>
+                ) : (
+                  <div className="grid md:grid-cols-2 gap-6">
+                    <div className="space-y-4">
+                      {subscriptionStatus?.isActive ? (
                         <>
-                          {shortenAddress(tx.hash)}
+                          <div className="info-panel">
+                            <p className="panel-label">Current Tier</p>
+                            <p className="panel-value flex items-center gap-2">
+                              {subscriptionStatus.tier === 1
+                                ? <><StarIcon /><span className="text-orange-600">Premium</span></>
+                                : <><ShieldIcon /><span className="text-cyan-700">Basic</span></>}
+                            </p>
+                          </div>
+                          <div className="info-panel">
+                            <p className="panel-label">Expires On</p>
+                            <p className="panel-value">{subscriptionStatus.expiryDate}</p>
+                          </div>
+                          <div className="info-panel">
+                            <p className="panel-label">Subscription Progress</p>
+                            <div className="mt-2">
+                              <ProgressBar
+                                percent={subscriptionProgress}
+                                colorClass={subscriptionProgress > 80
+                                  ? 'bg-gradient-to-r from-rose-500 to-red-600'
+                                  : 'bg-gradient-to-r from-cyan-500 to-blue-600'}
+                              />
+                              <p className="text-xs text-slate-500 mt-1">{subscriptionProgress}% elapsed</p>
+                            </div>
+                          </div>
                           <button
-                            onClick={async () => {
-                              try {
-                                await navigator.clipboard.writeText(tx.hash);
-                                setNotice('Transaction hash copied!');
-                                setTimeout(() => setNotice(null), 2000);
-                              } catch {
-                                setError('Failed to copy hash');
-                              }
-                            }}
-                            className="text-cyan-600 hover:text-cyan-800 text-xs"
+                            onClick={() => setShowUnsubscribeConfirm(true)}
+                            disabled={loading}
+                            className="danger-btn"
                           >
-                            Copy
+                            Cancel Subscription
                           </button>
                         </>
                       ) : (
-                        'No hash available'
+                        <div className="empty-state">No active subscription. Choose a plan below.</div>
                       )}
-                    </p>
-                    {tx.error && (
-                      <div className="mt-2 bg-red-50 border border-red-200 rounded px-2 py-1">
-                        <p className="text-xs text-red-700 font-semibold">Error:</p>
-                        <p className="text-xs text-red-600">{tx.error}</p>
-                      </div>
-                    )}
-                  </div>
-                  <div className="flex flex-col items-end gap-2">
-                    <span className={`tx-status ${tx.status}`}>
-                      {tx.status}
-                    </span>
-                    {tx.blockNumber && (
-                      <span className="text-xs text-slate-500">
-                        Block #{tx.blockNumber}
-                      </span>
-                    )}
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
+                    </div>
 
-        {showUnsubscribeConfirm && (
-          <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-50">
-            <div className="bg-white rounded-2xl p-8 max-w-md mx-4 shadow-2xl">
-              <h3 className="text-2xl font-bold text-slate-900 mb-3">Unsubscribe Confirmation</h3>
-              <p className="text-slate-600 mb-6">You will lose access immediately. Continue?</p>
-              <div className="flex space-x-3">
+                    <div>
+                      {subscriptionStatus?.isActive && countdown ? (
+                        <div className="bg-gradient-to-br from-cyan-600 to-blue-700 rounded-2xl p-6 text-white h-full flex flex-col justify-center">
+                          <p className="text-sm font-semibold text-cyan-200 mb-1 uppercase tracking-wide">Time Remaining</p>
+                          <p className="text-3xl font-extrabold mb-3 font-mono">{countdown}</p>
+                          <ProgressBar
+                            percent={100 - subscriptionProgress}
+                            colorClass="bg-white/40"
+                          />
+                          <p className="text-xs text-cyan-200 mt-3">Auto-refreshes every 20 seconds</p>
+                        </div>
+                      ) : (
+                        <div className="empty-state h-full flex items-center justify-center">
+                          Countdown appears once your subscription is active.
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* ── Plans ───────────────────────────────────────────────────────── */}
+            {account && (
+              <div className="card mb-8">
+                <h2 className="text-2xl font-bold text-slate-800 mb-1 text-center">Choose Your Plan</h2>
+                <p className="text-slate-500 text-center mb-8">30-day access — confirm in MetaMask</p>
+
+                {initialLoadPending || statusLoading ? (
+                  <div className="grid md:grid-cols-2 gap-8">
+                    <div className="skeleton h-72 w-full" />
+                    <div className="skeleton h-72 w-full" />
+                  </div>
+                ) : (
+                  <div className="grid md:grid-cols-2 gap-8">
+
+                    {/* Basic plan */}
+                    <div className="plan-card border-cyan-200 hover:border-cyan-400">
+                      <div className="plan-header">
+                        <h3 className="text-2xl font-bold text-slate-800">Basic</h3>
+                        <span className="plan-pill bg-cyan-100 text-cyan-700">Starter</span>
+                      </div>
+                      <p className="text-slate-500 mb-4 text-sm">Perfect for getting started on-chain</p>
+                      <div className="mb-2">
+                        <span className="text-4xl font-extrabold text-slate-900">{tierPrices.basic ?? '—'}</span>
+                        {tierPrices.basic && <span className="text-lg text-slate-500 ml-2">ETH</span>}
+                      </div>
+                      <p className="text-xs text-slate-400 mb-6">30 days · renew anytime</p>
+                      <ul className="space-y-2 mb-8">
+                        <FeatureItem text="On-chain subscription proof" />
+                        <FeatureItem text="Standard feature access" />
+                        <FeatureItem text="Email support" />
+                        <FeatureItem text="Basic analytics dashboard" />
+                        <FeatureItem text="Renewal at any time" />
+                      </ul>
+                      {!subscriptionStatus?.isActive ? (
+                        <button
+                          onClick={() => handleSubscribe(0)}
+                          disabled={loading || !networkMatches || !backend.contractReady || !tierPrices.basic || !pricesReady}
+                          className="subscribe-btn w-full"
+                        >
+                          {loading ? 'Processing…' : 'Subscribe — Basic'}
+                        </button>
+                      ) : (
+                        <button
+                          onClick={() => handleRenew(0)}
+                          disabled={loading || !networkMatches || !backend.contractReady || !tierPrices.basic || !pricesReady}
+                          className="renew-btn w-full"
+                        >
+                          {loading ? 'Processing…' : 'Renew — Basic'}
+                        </button>
+                      )}
+                    </div>
+
+                    {/* Premium plan */}
+                    <div className="plan-card plan-card-featured border-orange-300 hover:border-orange-400">
+                      <div className="absolute -top-3 left-1/2 -translate-x-1/2">
+                        <span className="bg-gradient-to-r from-orange-500 to-rose-500 text-white text-xs font-bold px-4 py-1 rounded-full shadow-lg">
+                          ⭐ Most Popular
+                        </span>
+                      </div>
+                      <div className="plan-header mt-3">
+                        <h3 className="text-2xl font-bold text-slate-800">Premium</h3>
+                        <span className="plan-pill bg-orange-100 text-orange-700">Pro</span>
+                      </div>
+                      <p className="text-slate-500 mb-4 text-sm">Full access with priority support</p>
+                      <div className="mb-2">
+                        <span className="text-4xl font-extrabold text-slate-900">{tierPrices.premium ?? '—'}</span>
+                        {tierPrices.premium && <span className="text-lg text-slate-500 ml-2">ETH</span>}
+                      </div>
+                      <p className="text-xs text-slate-400 mb-6">30 days · renew anytime</p>
+                      <ul className="space-y-2 mb-8">
+                        <PremiumFeatureItem text="Everything in Basic" />
+                        <PremiumFeatureItem text="Priority on-chain verification" />
+                        <PremiumFeatureItem text="Advanced analytics & reports" />
+                        <PremiumFeatureItem text="Priority support (24/7)" />
+                        <PremiumFeatureItem text="Early access to new features" />
+                        <PremiumFeatureItem text="Premium badge on-chain" />
+                      </ul>
+                      {!subscriptionStatus?.isActive ? (
+                        <button
+                          onClick={() => handleSubscribe(1)}
+                          disabled={loading || !networkMatches || !backend.contractReady || !tierPrices.premium || !pricesReady}
+                          className="subscribe-btn w-full bg-gradient-to-r from-orange-500 to-rose-500 hover:from-orange-600 hover:to-rose-600"
+                        >
+                          {loading ? 'Processing…' : 'Subscribe — Premium'}
+                        </button>
+                      ) : (
+                        <button
+                          onClick={() => handleRenew(1)}
+                          disabled={loading || !networkMatches || !backend.contractReady || !tierPrices.premium || !pricesReady}
+                          className="renew-btn w-full"
+                        >
+                          {loading ? 'Processing…' : 'Renew — Premium'}
+                        </button>
+                      )}
+                    </div>
+
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* ── Connect CTA (no wallet) ──────────────────────────────────────── */}
+            {!account && (
+              <div className="card mb-8 text-center py-16">
+                <div className="text-6xl mb-4">🔗</div>
+                <h2 className="text-2xl font-bold text-slate-800 mb-2">Connect Your Wallet</h2>
+                <p className="text-slate-500 mb-6 max-w-md mx-auto">
+                  Connect MetaMask to subscribe, renew, or manage your on-chain membership.
+                </p>
                 <button
-                  onClick={() => setShowUnsubscribeConfirm(false)}
-                  className="flex-1 px-4 py-3 bg-slate-200 hover:bg-slate-300 text-slate-800 font-semibold rounded-lg"
+                  onClick={connectWallet}
+                  disabled={loading || !walletAvailable}
+                  className="wallet-connect-btn mx-auto"
                 >
-                  Cancel
+                  <WalletIcon />
+                  {loading ? 'Connecting…' : walletAvailable ? 'Connect MetaMask' : 'MetaMask Not Installed'}
                 </button>
-                <button
-                  onClick={async () => {
-                    setShowUnsubscribeConfirm(false);
-                    await handleUnsubscribe();
-                  }}
-                  disabled={loading || !networkMatches}
-                  className="flex-1 px-4 py-3 bg-red-600 hover:bg-red-700 text-white font-semibold rounded-lg"
-                >
-                  {loading ? 'Unsubscribing...' : 'Yes, Unsubscribe'}
+                {!walletAvailable && (
+                  <div className="mt-4 space-y-2">
+                    <p className="text-xs text-slate-400">
+                      Install{' '}
+                      <a href="https://metamask.io" target="_blank" rel="noreferrer" className="text-cyan-600 underline">
+                        MetaMask <ExternalLinkIcon />
+                      </a>{' '}
+                      to use this dApp.
+                    </p>
+                    <button
+                      onClick={() => syncWalletProvider(true)}
+                      className="secondary-action-btn w-auto px-4 py-2 mx-auto"
+                    >
+                      Retry Wallet Detection
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+          </>
+        )}
+
+        {/* ══════════════════════════════════════════════════════════════════════ */}
+        {/* HISTORY TAB                                                           */}
+        {/* ══════════════════════════════════════════════════════════════════════ */}
+        {activeTab === 'history' && (
+          <div className="card mb-8">
+            <div className="flex items-center justify-between mb-6">
+              <div>
+                <h2 className="text-2xl font-bold text-slate-800">Transaction History</h2>
+                <p className="text-sm text-slate-500">Latest 20 transactions (local + backend)</p>
+              </div>
+              <div className="flex gap-2">
+                {account && (
+                  <button
+                    onClick={() => syncTransactionsFromBackend(account, true)}
+                    disabled={txSyncing}
+                    className="secondary-action-btn w-auto px-4 py-2 flex items-center gap-1.5"
+                  >
+                    <RefreshIcon spinning={txSyncing} />
+                    Sync
+                  </button>
+                )}
+                <button onClick={clearTxHistory} className="secondary-action-btn w-auto px-4 py-2 text-rose-600 border-rose-200 hover:bg-rose-50">
+                  Clear
                 </button>
               </div>
             </div>
+
+            {txSyncing && transactions.length === 0 ? (
+              <div className="space-y-3">
+                {[1, 2, 3].map((i) => <div key={i} className="skeleton h-16 w-full" />)}
+              </div>
+            ) : transactions.length === 0 ? (
+              <div className="empty-state">No transactions yet. Make a subscription action to see records here.</div>
+            ) : (
+              <div className="space-y-3">
+                {transactions.map((tx) => (
+                  <div key={tx.id} className="tx-row">
+                    <div className="min-w-0 flex-1">
+                      <p className="tx-title">
+                        {tx.type}{tx.tier ? ` · ${tx.tier}` : ''}
+                        {tx.amount ? <span className="ml-2 text-slate-500 font-normal">{tx.amount}</span> : null}
+                      </p>
+                      <p className="tx-meta">{tx.timestamp ? formatPreciseDateTime(tx.timestamp) : 'Unknown time'}</p>
+                      {tx.hash && (
+                        <p className="tx-meta font-mono">
+                          {shortenAddress(tx.hash)}
+                          {tx.blockNumber && <span className="ml-2">· Block #{tx.blockNumber}</span>}
+                        </p>
+                      )}
+                      {tx.error && <p className="text-xs text-red-600 mt-1 truncate">{tx.error}</p>}
+                    </div>
+                    <span className={`tx-status ${tx.status}`}>{tx.status}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* Summary row */}
+            {transactions.length > 0 && (
+              <div className="mt-6 pt-4 border-t border-slate-200 grid grid-cols-3 gap-4 text-center">
+                <div>
+                  <p className="text-2xl font-bold text-slate-800">{transactions.length}</p>
+                  <p className="text-xs text-slate-500 uppercase tracking-wide">Total</p>
+                </div>
+                <div>
+                  <p className="text-2xl font-bold text-emerald-600">{confirmedCount}</p>
+                  <p className="text-xs text-slate-500 uppercase tracking-wide">Confirmed</p>
+                </div>
+                <div>
+                  <p className="text-2xl font-bold text-slate-800">{totalEthSpent} ETH</p>
+                  <p className="text-xs text-slate-500 uppercase tracking-wide">Spent</p>
+                </div>
+              </div>
+            )}
           </div>
         )}
+
+        {/* ── Footer ──────────────────────────────────────────────────────────── */}
+        <footer className="text-center text-xs text-slate-400 pb-8 space-y-1">
+          <p>SubChain · Decentralised Subscription Service</p>
+          <p>Contract: <span className="font-mono">{shortenAddress(effectiveContractAddress)}</span></p>
+        </footer>
       </div>
+
+      {/* ── Unsubscribe confirmation modal ──────────────────────────────────── */}
+      {showUnsubscribeConfirm && (
+        <div
+          className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-50 p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="unsub-title"
+        >
+          <div className="bg-white rounded-2xl p-8 max-w-md w-full shadow-2xl animate-fade-in">
+            <div className="text-4xl mb-4 text-center">⚠️</div>
+            <h3 id="unsub-title" className="text-2xl font-bold text-slate-900 mb-2 text-center">
+              Cancel Subscription?
+            </h3>
+            <p className="text-slate-600 mb-6 text-center text-sm">
+              You will lose access immediately and no refund will be issued. This action cannot be undone.
+            </p>
+            <div className="flex gap-3">
+              <button
+                onClick={() => setShowUnsubscribeConfirm(false)}
+                className="flex-1 px-4 py-3 bg-slate-200 hover:bg-slate-300 text-slate-800 font-semibold rounded-xl transition"
+              >
+                Keep Subscription
+              </button>
+              <button
+                onClick={async () => {
+                  setShowUnsubscribeConfirm(false);
+                  await handleUnsubscribe();
+                }}
+                disabled={loading || !networkMatches}
+                className="flex-1 px-4 py-3 bg-red-600 hover:bg-red-700 text-white font-semibold rounded-xl transition disabled:opacity-50"
+              >
+                {loading ? 'Cancelling…' : 'Yes, Cancel'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

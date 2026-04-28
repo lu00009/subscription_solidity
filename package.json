@@ -6,13 +6,23 @@
   "scripts": {
     "compile": "hardhat compile",
     "test": "hardhat test",
+    "test:coverage": "hardhat coverage",
     "deploy": "hardhat run scripts/deploy.js --network localhost",
+    "deploy:sepolia": "hardhat run scripts/deploy.js --network sepolia",
     "node": "hardhat node",
     "backend": "cd backend && npm start",
+    "backend:dev": "cd backend && npm run dev",
     "frontend": "cd frontend && npm start",
-    "dev": "concurrently \"npm run node\" \"npm run backend\" \"npm run frontend\""
+    "frontend:build": "cd frontend && npm run build",
+    "dev": "concurrently \"npm run node\" \"npm run backend\" \"npm run frontend\"",
+    "dev:backend": "concurrently \"npm run node\" \"npm run backend\"",
+    "setup": "npm install && cd backend && npm install && cd ../frontend && npm install && cd ..",
+    "clean": "hardhat clean && rm -rf artifacts cache",
+    "lint": "npx eslint .",
+    "format": "npx prettier --write .",
+    "start:all": "concurrently -n \"BLOCKCHAIN,BACKEND,FRONTEND\" -c \"blue,green,yellow\" \"npm run node\" \"npm run backend\" \"npm run frontend\""
   },
-  "keywords": ["solidity", "hardhat", "ethereum", "dapp", "subscription"],
+  "keywords": ["solidity", "hardhat", "ethereum", "dapp", "subscription", "web3", "blockchain"],
   "author": "Your Name",
   "license": "MIT",
   "devDependencies": {
@@ -25,5 +35,13 @@
   "dependencies": {
     "dotenv": "^16.3.1",
     "concurrently": "^8.2.2"
+  },
+  "engines": {
+    "node": ">=16.0.0",
+    "npm": ">=8.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yourusername/subscription-dapp.git"
   }
 }

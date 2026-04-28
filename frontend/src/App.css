@@ -134,6 +134,43 @@
          hover:bg-white/20 transition duration-200;
 }
 
+/* ─── Light theme overrides ─────────────────────────────────── */
+.app-light .theme-toggle-btn {
+  @apply border-slate-300 text-slate-700 bg-white/80 hover:bg-white;
+}
+
+.app-light .status-tile {
+  @apply bg-white/80 border-slate-200 shadow-sm;
+}
+
+.app-light .status-label {
+  @apply text-slate-500;
+}
+
+.app-light .stats-card {
+  @apply bg-white/85 border-slate-200 hover:bg-white;
+}
+
+.app-light .stats-label {
+  @apply text-slate-600;
+}
+
+.app-light .stats-value {
+  @apply text-slate-900;
+}
+
+.app-light .alert-error {
+  @apply bg-red-50 border-red-200 text-red-700;
+}
+
+.app-light .alert-success {
+  @apply bg-emerald-50 border-emerald-200 text-emerald-700;
+}
+
+.app-light .alert-warning {
+  @apply bg-amber-50 border-amber-200 text-amber-800;
+}
+
 /* ─── Transaction rows ───────────────────────────────────────── */
 .tx-row {
   @apply flex items-center justify-between gap-4
