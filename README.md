@@ -115,7 +115,10 @@ npm run node
 npm run deploy
 ```
 
-The deployment script will automatically update your `.env` files with the contract address.
+The deployment script will automatically update these files with the contract address:
+- `.env`
+- `backend/.env`
+- `frontend/.env`
 
 ### 4. Run the Application
 
@@ -141,7 +144,7 @@ npm run frontend
 ### 5. Access the Application
 
 - **Frontend**: http://localhost:3000
-- **Backend API**: http://localhost:3001
+- **Backend API**: http://localhost:3003
 - **Hardhat Network**: http://localhost:8545
 
 ## 🧪 Testing
@@ -209,6 +212,8 @@ Get contract statistics and configuration.
 
 #### Root `.env`
 ```
+CONTRACT_ADDRESS=deployed_contract_address
+REACT_APP_CONTRACT_ADDRESS=deployed_contract_address
 PRIVATE_KEY=your_private_key_here
 SEPOLIA_URL=https://sepolia.infura.io/v3/your_infura_project_id
 ETHERSCAN_API_KEY=your_etherscan_api_key
@@ -216,7 +221,7 @@ ETHERSCAN_API_KEY=your_etherscan_api_key
 
 #### Backend `backend/.env`
 ```
-PORT=3001
+PORT=3003
 CONTRACT_ADDRESS=deployed_contract_address
 RPC_URL=http://127.0.0.1:8545
 ```
@@ -303,7 +308,7 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 - Verify you have sufficient test ETH
 
 **Backend Connection Issues**
-- Ensure backend server is running on port 3001
+- Ensure backend server is running on port 3003
 - Check that contract address is correctly set in .env
 - Verify RPC URL is accessible
 

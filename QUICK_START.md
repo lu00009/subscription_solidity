@@ -55,7 +55,7 @@ npm run frontend
 ## 🌐 Access Points
 
 - **Frontend**: http://localhost:3000
-- **Backend API**: http://localhost:3001
+- **Backend API**: http://localhost:3003
 - **Blockchain**: http://localhost:8545
 
 ## 🦊 MetaMask Setup
