@@ -164,12 +164,12 @@ contract SubscriptionService is Ownable, ReentrancyGuard {
      * @param _user The address to check
      * @return expiry Expiry timestamp
      * @return tier Subscription tier
-     * @return isActive Whether subscription is currently active
+     * @return active Whether subscription is currently active
      */
     function getSubscriptionDetails(address _user) external view returns (
         uint256 expiry,
         Tier tier,
-        bool isActive
+        bool active
     ) {
         Subscription memory sub = subscriptions[_user];
         return (sub.expiry, sub.tier, sub.expiry > block.timestamp);
@@ -240,12 +240,12 @@ contract SubscriptionService is Ownable, ReentrancyGuard {
     /**
      * @dev Batch check subscription status for multiple addresses
      * @param _users Array of addresses to check
-     * @return isActive Array of active status for each address
+     * @return activeStatuses Array of active status for each address
      */
-    function batchCheckActive(address[] calldata _users) external view returns (bool[] memory isActive) {
-        isActive = new bool[](_users.length);
+    function batchCheckActive(address[] calldata _users) external view returns (bool[] memory activeStatuses) {
+        activeStatuses = new bool[](_users.length);
         for (uint256 i = 0; i < _users.length; i++) {
-            isActive[i] = subscriptions[_users[i]].expiry > block.timestamp;
+            activeStatuses[i] = subscriptions[_users[i]].expiry > block.timestamp;
         }
     }
 }

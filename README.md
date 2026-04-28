@@ -60,6 +60,39 @@ A full-stack decentralized application (DApp) for managing subscription payments
 - MetaMask browser extension
 - Git
 
+### Recommended Daily Workflow (Best Way)
+Use this flow each time you start local development:
+
+1. Terminal 1 (blockchain):
+```bash
+npm run node
+```
+If you see `EADDRINUSE: 127.0.0.1:8545`, a node is already running. Keep using it and do not start another one.
+
+2. Terminal 2 (deploy contract to current local chain):
+```bash
+npm run deploy
+```
+
+3. Terminal 3 (backend):
+```bash
+npm run backend
+```
+
+4. Terminal 4 (frontend):
+```bash
+npm run frontend
+```
+
+5. Open:
+- Frontend: `http://localhost:3000`
+- Backend health: `http://localhost:3003/api/health`
+
+6. If wallet says MetaMask is not detected:
+- Unlock MetaMask
+- Refresh page
+- Click `Retry Wallet Detection` in the app
+
 ### One-Command Setup
 ```bash
 # Clone repository

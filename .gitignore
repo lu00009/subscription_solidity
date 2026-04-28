@@ -126,3 +126,7 @@ frontend/.env.production.local
 frontend/.env
 backend/.env
 .env
+
+# Accidental local files
+/hardhat
+/subscription-dapp@*
