@@ -50,15 +50,13 @@
   - Health check endpoint
   - Service status
   - Contract connection status
-  - Uptime tracking
-  - Cache metrics
+  - Webhook listener readiness
   - Event listener status
 
 - ✅ **Subscription Management**
   - Get subscription status
   - Real-time blockchain sync
-  - 30-second caching with TTL
-  - Automatic cache invalidation on events
+  - Expiry and tier pricing response data
 
 - ✅ **Transaction Tracking**
   - Store transaction history
@@ -68,37 +66,33 @@
   - Pagination support (up to 100 records)
   - Automatic cleanup (max 500 records)
 
-- ✅ **Statistics & Analytics**
-  - Total subscribers count
-  - Active subscribers count
-  - Total revenue tracking
-  - Transaction breakdown by type
-  - Transaction breakdown by status
-  - Revenue breakdown by tier
-  - Recent activity (last 24 hours)
-  - Cache metrics
+- ✅ **Statistics**
+  - Tier price reporting
+  - Contract balance reporting
+  - Unique subscriber tracking
+  - Transaction volume snapshot
 
 - ✅ **Event Listening**
   - Real-time contract event monitoring
-  - Automatic transaction recording
-  - Cache invalidation on events
-  - Statistics auto-update
+  - Webhook dispatch on contract events
+  - Event de-duplication by tx/log index
+  - Delivery logs per webhook endpoint
 
 - ✅ **Scheduled Tasks**
   - Daily expiry check (9 AM)
-  - Hourly cache cleanup
-  - Automatic statistics updates
-
-- ✅ **Cache Management**
-  - Clear all cache
-  - Clear specific address cache
-  - Automatic stale entry removal
 
 - ✅ **Reminder System**
   - Check expiring subscriptions
   - 7-day advance warning
   - Batch address checking
-  - Days and hours until expiry
+  - Days until expiry
+
+- ✅ **Webhook Notification System**
+  - Register/list/update/delete webhook endpoints
+  - Manual test delivery endpoint
+  - HMAC SHA-256 signatures (`x-webhook-signature`)
+  - Retry with exponential backoff
+  - Admin API key protection for webhook routes
 
 ### Frontend Dashboard
 
@@ -152,6 +146,13 @@
   - Error message display
   - Empty state handling
   - Skeleton loading states
+
+- ✅ **Webhook Control Center (Frontend)**
+  - Dedicated Webhooks tab
+  - Register endpoint form (URL, events, secret)
+  - Enable/disable and delete controls
+  - Manual test trigger button
+  - Delivery log viewer
 
 - ✅ **Theme System**
   - Dark/Light theme toggle

@@ -66,10 +66,14 @@ subscription-dapp/
 | `/api/health` | GET | Health check |
 | `/api/status/:address` | GET | Get subscription status |
 | `/api/stats` | GET | Get statistics |
-| `/api/analytics` | GET | Get analytics |
+| `/api/balance` | GET | Get contract balance |
 | `/api/transactions/:address` | GET | Get transactions |
 | `/api/transactions` | POST | Create transaction |
-| `/api/cache/clear` | POST | Clear cache |
+| `/api/transactions/:id` | PATCH | Update transaction |
+| `/api/reminder` | POST | Check expiring subscriptions |
+| `/api/webhooks` | GET/POST | List or register webhook (admin) |
+| `/api/webhooks/:id/test` | POST | Send manual webhook test (admin) |
+| `/api/webhooks/logs` | GET | View webhook delivery logs (admin) |
 
 ### 🔐 Smart Contract Functions
 
@@ -103,6 +107,8 @@ updateTierPrice(tier, price)         // Update pricing
 - ✅ Search & filter
 - ✅ Dark/Light theme
 - ✅ Statistics dashboard
+- ✅ Webhook management tab
+- ✅ Webhook delivery logs panel
 
 ### 🧪 Testing
 
@@ -125,12 +131,18 @@ REACT_APP_CONTRACT_ADDRESS=0x...
 PORT=3003
 CONTRACT_ADDRESS=0x...
 RPC_URL=http://127.0.0.1:8545
+ADMIN_API_KEY=change_me_admin_key
+WEBHOOK_SIGNING_SECRET=change_me_webhook_secret
+WEBHOOK_TIMEOUT_MS=10000
+WEBHOOK_MAX_ATTEMPTS=3
+WEBHOOK_RETRY_BASE_MS=1500
 ```
 
 #### `frontend/.env`
 ```env
 REACT_APP_CONTRACT_ADDRESS=0x...
 REACT_APP_NETWORK_ID=1337
+REACT_APP_ADMIN_API_KEY=change_me_admin_key
 ```
 
 ### 🐛 Common Issues & Fixes

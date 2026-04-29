@@ -146,12 +146,18 @@ REACT_APP_CONTRACT_ADDRESS=<deployed-contract-address>
 PORT=3003
 CONTRACT_ADDRESS=<deployed-contract-address>
 RPC_URL=http://127.0.0.1:8545
+ADMIN_API_KEY=<strong-admin-key>
+WEBHOOK_SIGNING_SECRET=<strong-signing-secret>
+WEBHOOK_TIMEOUT_MS=10000
+WEBHOOK_MAX_ATTEMPTS=3
+WEBHOOK_RETRY_BASE_MS=1500
 ```
 
 ### `frontend/.env`
 ```env
 REACT_APP_CONTRACT_ADDRESS=<deployed-contract-address>
 REACT_APP_NETWORK_ID=1337
+REACT_APP_ADMIN_API_KEY=<same-admin-key-if-needed>
 ```
 
 ## 📡 API Endpoints
@@ -171,9 +177,9 @@ GET /api/status/:address
 GET /api/stats
 ```
 
-### Get Analytics
+### Get Contract Balance
 ```bash
-GET /api/analytics
+GET /api/balance
 ```
 
 ### Get Transactions
@@ -199,10 +205,15 @@ POST /api/reminder
 Body: { addresses: ["0x..."] }
 ```
 
-### Clear Cache
+### Webhooks (Admin)
 ```bash
-POST /api/cache/clear
-Body: { address: "0x..." } // Optional, clears all if omitted
+GET /api/webhooks/summary
+POST /api/webhooks
+GET /api/webhooks
+PATCH /api/webhooks/:id
+DELETE /api/webhooks/:id
+POST /api/webhooks/:id/test
+GET /api/webhooks/logs?limit=50
 ```
 
 ## 🧪 Testing

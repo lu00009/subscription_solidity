@@ -17,6 +17,7 @@ A full-stack decentralized application (DApp) for managing subscription payments
 - **Real-Time Updates** - Live blockchain event monitoring
 - **Transaction History** - Complete audit trail with search and filtering
 - **Statistics Dashboard** - Revenue, subscribers, and analytics
+- **Webhook Automation** - Real-time blockchain event notifications with retries and signatures
 
 ### 🎨 User Experience
 - **Beautiful UI** - Modern gradient design with animations
@@ -92,6 +93,11 @@ npm run frontend
 - Unlock MetaMask
 - Refresh page
 - Click `Retry Wallet Detection` in the app
+
+7. To use webhook management:
+- Set `ADMIN_API_KEY` in `backend/.env`
+- Open the **Webhooks** tab in frontend
+- Register/test endpoints and monitor logs
 
 ### One-Command Setup
 ```bash
@@ -267,9 +273,9 @@ GET /status/:address
 GET /stats
 ```
 
-#### Get Analytics
+#### Get Contract Balance
 ```bash
-GET /analytics
+GET /balance
 ```
 
 #### Transaction Management
@@ -279,9 +285,20 @@ POST /transactions
 PATCH /transactions/:id
 ```
 
-#### Cache Management
+#### Webhook Management (Admin)
 ```bash
-POST /cache/clear
+GET /webhooks/summary
+POST /webhooks
+GET /webhooks
+PATCH /webhooks/:id
+DELETE /webhooks/:id
+POST /webhooks/:id/test
+GET /webhooks/logs?limit=50
+```
+
+#### Expiry Reminder Check
+```bash
+POST /reminder
 ```
 
 For complete API documentation, see [API_DOCUMENTATION.md](./API_DOCUMENTATION.md)
@@ -387,6 +404,8 @@ REACT_APP_CONTRACT_ADDRESS=<deployed_address>
 # backend/.env
 RPC_URL=https://sepolia.infura.io/v3/YOUR_INFURA_KEY
 CONTRACT_ADDRESS=<deployed_address>
+ADMIN_API_KEY=<strong-admin-key>
+WEBHOOK_SIGNING_SECRET=<strong-signing-secret>
 ```
 
 ### Production Deployment
@@ -401,7 +420,7 @@ See [DEPLOYMENT_GUIDE.md](./DEPLOYMENT_GUIDE.md) for complete production deploym
 - **Tests:** 300+ lines
 - **Documentation:** 2500+ lines
 - **Total Features:** 150+
-- **API Endpoints:** 12
+- **API Endpoints:** 16
 - **Test Cases:** 25+
 
 ## 🎯 Roadmap
@@ -409,10 +428,11 @@ See [DEPLOYMENT_GUIDE.md](./DEPLOYMENT_GUIDE.md) for complete production deploym
 ### Current Version (v1.0.0) ✅
 - Two-tier subscription system
 - Complete frontend dashboard
-- Backend API with caching
+- Backend API with transaction tracking
 - Real-time event monitoring
+- Blockchain webhook delivery with retry/signature
 - Transaction tracking
-- Statistics and analytics
+- Webhook management UI in frontend
 
 ### Future Enhancements
 - [ ] Email notifications
@@ -470,4 +490,4 @@ Give a ⭐️ if this project helped you!
 
 **Built with ❤️ using Solidity, React, and Node.js**
 
-**Version:** 1.0.0 | **Last Updated:** January 2024 | **Status:** Production Ready ✅
+**Version:** 1.1.0 | **Last Updated:** April 2026 | **Status:** Production Ready ✅
