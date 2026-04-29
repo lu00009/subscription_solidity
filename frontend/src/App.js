@@ -10,6 +10,8 @@ const TX_HISTORY_STORAGE_KEY = 'subscription_dapp_tx_history';
 const THEME_STORAGE_KEY = 'subscription_dapp_theme';
 const SUBSCRIPTION_DURATION_DAYS = 30;
 const EXPECTED_CHAIN_HEX = `0x${EXPECTED_CHAIN_ID.toString(16)}`;
+const DEFAULT_WEBHOOK_EVENTS = ['Subscribed', 'Renewed', 'Unsubscribed'];
+const WEBHOOK_ADMIN_KEY_FROM_ENV = process.env.REACT_APP_ADMIN_API_KEY || '';
 
 const contractABI = [
   {
@@ -62,6 +64,11 @@ const contractABI = [
 
 // ─── Axios instance ────────────────────────────────────────────────────────────
 const api = axios.create({ timeout: 8000 });
+
+function buildAdminHeaders(adminKey) {
+  if (!adminKey) return {};
+  return { 'x-api-key': adminKey };
+}
 
 // ─── Formatters ───────────────────────────────────────────────────────────────
 const preciseDateTimeFormat = new Intl.DateTimeFormat(undefined, {
@@ -127,6 +134,15 @@ function shortenAddress(address) {
 
 function getTierLabel(tier) {
   return Number(tier) === 1 ? 'Premium' : 'Basic';
+}
+
+function parseWebhookEvents(raw) {
+  if (!raw) return DEFAULT_WEBHOOK_EVENTS;
+  const parsed = String(raw)
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return parsed.length > 0 ? parsed : DEFAULT_WEBHOOK_EVENTS;
 }
 
 function toTxKey(tx) {
@@ -341,7 +357,18 @@ function App() {
   const [theme, setTheme]   = useState(getInitialTheme);
   const [copied, setCopied] = useState(false);
   const [showUnsubscribeConfirm, setShowUnsubscribeConfirm] = useState(false);
-  const [activeTab, setActiveTab] = useState('dashboard'); // 'dashboard' | 'history'
+  const [activeTab, setActiveTab] = useState('dashboard'); // 'dashboard' | 'history' | 'webhooks'
+  const [webhookAdminKey, setWebhookAdminKey] = useState(WEBHOOK_ADMIN_KEY_FROM_ENV);
+  const [webhookEventsInput, setWebhookEventsInput] = useState(DEFAULT_WEBHOOK_EVENTS.join(','));
+  const [webhookForm, setWebhookForm] = useState({
+    url: '',
+    secret: '',
+    description: ''
+  });
+  const [webhooks, setWebhooks] = useState([]);
+  const [webhookLogs, setWebhookLogs] = useState([]);
+  const [webhookSummary, setWebhookSummary] = useState(null);
+  const [webhookBusy, setWebhookBusy] = useState(false);
 
   // Data
   const [transactions, setTransactions]         = useState(getInitialTxHistory);
@@ -582,6 +609,129 @@ function App() {
   const patchTxInBackend = async (idOrHash, payload) => {
     if (!idOrHash) return;
     try { await api.patch(`/api/transactions/${encodeURIComponent(idOrHash)}`, payload); } catch {}
+  };
+
+  // ─── Webhooks ───────────────────────────────────────────────────────────────
+  const loadWebhookSummary = async () => {
+    try {
+      const response = await api.get('/api/webhooks/summary', {
+        headers: buildAdminHeaders(webhookAdminKey)
+      });
+      setWebhookSummary(response.data || null);
+    } catch (err) {
+      addToast(getErrorMessage(err), 'error');
+    }
+  };
+
+  const loadWebhooks = async () => {
+    try {
+      const response = await api.get('/api/webhooks', {
+        headers: buildAdminHeaders(webhookAdminKey)
+      });
+      setWebhooks(Array.isArray(response?.data?.webhooks) ? response.data.webhooks : []);
+    } catch (err) {
+      addToast(getErrorMessage(err), 'error');
+    }
+  };
+
+  const loadWebhookLogs = async () => {
+    try {
+      const response = await api.get('/api/webhooks/logs?limit=40', {
+        headers: buildAdminHeaders(webhookAdminKey)
+      });
+      setWebhookLogs(Array.isArray(response?.data?.logs) ? response.data.logs : []);
+    } catch (err) {
+      addToast(getErrorMessage(err), 'error');
+    }
+  };
+
+  const refreshWebhookData = async () => {
+    try {
+      setWebhookBusy(true);
+      await Promise.all([
+        loadWebhookSummary(),
+        loadWebhooks(),
+        loadWebhookLogs()
+      ]);
+    } finally {
+      setWebhookBusy(false);
+    }
+  };
+
+  const handleWebhookSubmit = async (event) => {
+    event.preventDefault();
+    if (!webhookForm.url.trim()) {
+      addToast('Webhook URL is required', 'warning');
+      return;
+    }
+
+    try {
+      setWebhookBusy(true);
+      await api.post('/api/webhooks', {
+        url: webhookForm.url.trim(),
+        events: parseWebhookEvents(webhookEventsInput),
+        secret: webhookForm.secret.trim(),
+        description: webhookForm.description.trim()
+      }, {
+        headers: buildAdminHeaders(webhookAdminKey)
+      });
+
+      setWebhookForm({ url: '', secret: '', description: '' });
+      setWebhookEventsInput(DEFAULT_WEBHOOK_EVENTS.join(','));
+      addToast('Webhook registered', 'success');
+      await refreshWebhookData();
+    } catch (err) {
+      addToast(getErrorMessage(err), 'error');
+    } finally {
+      setWebhookBusy(false);
+    }
+  };
+
+  const toggleWebhookActive = async (hook) => {
+    try {
+      setWebhookBusy(true);
+      await api.patch(`/api/webhooks/${hook.id}`, {
+        active: !hook.active
+      }, {
+        headers: buildAdminHeaders(webhookAdminKey)
+      });
+      addToast(`Webhook ${!hook.active ? 'enabled' : 'disabled'}`, 'success');
+      await refreshWebhookData();
+    } catch (err) {
+      addToast(getErrorMessage(err), 'error');
+    } finally {
+      setWebhookBusy(false);
+    }
+  };
+
+  const runWebhookTest = async (id) => {
+    try {
+      setWebhookBusy(true);
+      await api.post(`/api/webhooks/${id}/test`, {}, {
+        headers: buildAdminHeaders(webhookAdminKey)
+      });
+      addToast('Webhook test sent', 'success');
+      await refreshWebhookData();
+    } catch (err) {
+      addToast(getErrorMessage(err), 'error');
+    } finally {
+      setWebhookBusy(false);
+    }
+  };
+
+  const deleteWebhook = async (id) => {
+    try {
+      setWebhookBusy(true);
+      await api.delete(`/api/webhooks/${id}`, {
+        headers: buildAdminHeaders(webhookAdminKey)
+      });
+      addToast('Webhook deleted', 'success');
+      await refreshWebhookData();
+    } catch (err) {
+      addToast(getErrorMessage(err), 'error');
+    } finally {
+      setWebhookBusy(false);
+    }
   };
 
   // ─── Connect wallet ───────────────────────────────────────────────────────────
@@ -888,6 +1038,12 @@ function App() {
     }
   }, [account, contract]);
 
+  useEffect(() => {
+    if (activeTab === 'webhooks') {
+      refreshWebhookData();
+    }
+  }, [activeTab]);
+
   // Countdown timer
   useEffect(() => {
     if (!subscriptionStatus?.isActive) { setCountdown(null); return; }
@@ -1036,16 +1192,20 @@ function App() {
 
         {/* ── Tab navigation ───────────────────────────────────────────────────── */}
         <div className="flex gap-2 mb-6">
-          {['dashboard', 'history'].map((tab) => (
+          {[
+            { key: 'dashboard', label: '📊 Dashboard' },
+            { key: 'history', label: '📋 History' },
+            { key: 'webhooks', label: '🛰 Webhooks' }
+          ].map((tab) => (
             <button
-              key={tab}
-              onClick={() => setActiveTab(tab)}
+              key={tab.key}
+              onClick={() => setActiveTab(tab.key)}
               className={`px-5 py-2 rounded-xl text-sm font-semibold transition-all duration-200
-                ${activeTab === tab
+                ${activeTab === tab.key
                   ? 'bg-white text-slate-900 shadow-md'
                   : 'bg-white/10 text-white hover:bg-white/20'}`}
             >
-              {tab === 'dashboard' ? '📊 Dashboard' : '📋 History'}
+              {tab.label}
             </button>
           ))}
         </div>
@@ -1417,6 +1577,201 @@ function App() {
                 </div>
               </div>
             )}
+          </div>
+        )}
+
+        {activeTab === 'webhooks' && (
+          <div className="space-y-6 mb-8">
+            <div className="card">
+              <div className="flex flex-col md:flex-row md:items-end gap-4 md:justify-between">
+                <div>
+                  <h2 className="text-2xl font-bold text-slate-800">Webhook Control Center</h2>
+                  <p className="text-sm text-slate-500">Register endpoints, run tests, and monitor delivery logs.</p>
+                </div>
+                <button
+                  onClick={refreshWebhookData}
+                  disabled={webhookBusy}
+                  className="secondary-action-btn w-auto px-4 py-2 flex items-center justify-center gap-1.5"
+                >
+                  <RefreshIcon spinning={webhookBusy} />
+                  {webhookBusy ? 'Refreshing…' : 'Refresh Data'}
+                </button>
+              </div>
+
+              <div className="mt-5 grid md:grid-cols-3 gap-4">
+                <div className="info-panel">
+                  <p className="panel-label">Registered Webhooks</p>
+                  <p className="panel-value">{webhookSummary?.totalWebhooks ?? webhooks.length}</p>
+                </div>
+                <div className="info-panel">
+                  <p className="panel-label">Active Endpoints</p>
+                  <p className="panel-value">{webhookSummary?.activeWebhooks ?? webhooks.filter((w) => w.active).length}</p>
+                </div>
+                <div className="info-panel">
+                  <p className="panel-label">Recent Success Rate</p>
+                  <p className="panel-value">
+                    {webhookSummary?.recentDelivery?.checked
+                      ? `${Math.round((webhookSummary.recentDelivery.success / webhookSummary.recentDelivery.checked) * 100)}%`
+                      : '—'}
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            <div className="card">
+              <h3 className="text-xl font-bold text-slate-800 mb-1">Register New Webhook</h3>
+              <p className="text-sm text-slate-500 mb-5">Use your backend `ADMIN_API_KEY` to manage endpoints securely.</p>
+
+              <form onSubmit={handleWebhookSubmit} className="space-y-4">
+                <div className="grid md:grid-cols-2 gap-4">
+                  <div>
+                    <label htmlFor="adminKey" className="text-xs font-semibold uppercase tracking-wide text-slate-500">Admin API Key</label>
+                    <input
+                      id="adminKey"
+                      type="password"
+                      value={webhookAdminKey}
+                      onChange={(e) => setWebhookAdminKey(e.target.value)}
+                      placeholder="x-api-key value"
+                      className="w-full mt-1 px-3 py-2 border border-slate-300 rounded-lg text-sm"
+                    />
+                  </div>
+                  <div>
+                    <label htmlFor="webhookUrl" className="text-xs font-semibold uppercase tracking-wide text-slate-500">Webhook URL</label>
+                    <input
+                      id="webhookUrl"
+                      type="url"
+                      value={webhookForm.url}
+                      onChange={(e) => setWebhookForm((prev) => ({ ...prev, url: e.target.value }))}
+                      placeholder="https://example.com/webhooks/subscription"
+                      className="w-full mt-1 px-3 py-2 border border-slate-300 rounded-lg text-sm"
+                      required
+                    />
+                  </div>
+                </div>
+
+                <div className="grid md:grid-cols-2 gap-4">
+                  <div>
+                    <label htmlFor="webhookEvents" className="text-xs font-semibold uppercase tracking-wide text-slate-500">Events (comma separated)</label>
+                    <input
+                      id="webhookEvents"
+                      type="text"
+                      value={webhookEventsInput}
+                      onChange={(e) => setWebhookEventsInput(e.target.value)}
+                      placeholder="Subscribed, Renewed, Unsubscribed"
+                      className="w-full mt-1 px-3 py-2 border border-slate-300 rounded-lg text-sm"
+                    />
+                  </div>
+                  <div>
+                    <label htmlFor="webhookSecret" className="text-xs font-semibold uppercase tracking-wide text-slate-500">Signing Secret (optional)</label>
+                    <input
+                      id="webhookSecret"
+                      type="password"
+                      value={webhookForm.secret}
+                      onChange={(e) => setWebhookForm((prev) => ({ ...prev, secret: e.target.value }))}
+                      placeholder="secret for HMAC SHA-256"
+                      className="w-full mt-1 px-3 py-2 border border-slate-300 rounded-lg text-sm"
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <label htmlFor="webhookDesc" className="text-xs font-semibold uppercase tracking-wide text-slate-500">Description (optional)</label>
+                  <input
+                    id="webhookDesc"
+                    type="text"
+                    value={webhookForm.description}
+                    onChange={(e) => setWebhookForm((prev) => ({ ...prev, description: e.target.value }))}
+                    placeholder="Billing service endpoint"
+                    className="w-full mt-1 px-3 py-2 border border-slate-300 rounded-lg text-sm"
+                  />
+                </div>
+
+                <button
+                  type="submit"
+                  disabled={webhookBusy}
+                  className="subscribe-btn w-full md:w-auto px-6"
+                >
+                  {webhookBusy ? 'Saving…' : 'Register Webhook'}
+                </button>
+              </form>
+            </div>
+
+            <div className="card">
+              <h3 className="text-xl font-bold text-slate-800 mb-1">Registered Endpoints</h3>
+              <p className="text-sm text-slate-500 mb-5">Toggle, test, and remove webhook destinations.</p>
+
+              {webhooks.length === 0 ? (
+                <div className="empty-state">No webhooks registered yet.</div>
+              ) : (
+                <div className="space-y-3">
+                  {webhooks.map((hook) => (
+                    <div key={hook.id} className="tx-row">
+                      <div className="min-w-0 flex-1">
+                        <p className="tx-title break-all">{hook.url}</p>
+                        <p className="tx-meta">Events: {(hook.events || []).join(', ') || 'None'}</p>
+                        {hook.description && <p className="tx-meta">{hook.description}</p>}
+                        <p className="tx-meta">Created: {formatPreciseDateTime(hook.createdAt)}</p>
+                      </div>
+                      <div className="flex flex-col sm:flex-row gap-2 items-stretch sm:items-center">
+                        <span className={`tx-status ${hook.active ? 'confirmed' : 'failed'}`}>
+                          {hook.active ? 'active' : 'disabled'}
+                        </span>
+                        <button
+                          onClick={() => toggleWebhookActive(hook)}
+                          disabled={webhookBusy}
+                          className="secondary-action-btn w-auto px-3 py-1.5 text-xs"
+                        >
+                          {hook.active ? 'Disable' : 'Enable'}
+                        </button>
+                        <button
+                          onClick={() => runWebhookTest(hook.id)}
+                          disabled={webhookBusy}
+                          className="secondary-action-btn w-auto px-3 py-1.5 text-xs"
+                        >
+                          Test
+                        </button>
+                        <button
+                          onClick={() => deleteWebhook(hook.id)}
+                          disabled={webhookBusy}
+                          className="secondary-action-btn w-auto px-3 py-1.5 text-xs text-rose-600 border-rose-200 hover:bg-rose-50"
+                        >
+                          Delete
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div className="card">
+              <h3 className="text-xl font-bold text-slate-800 mb-1">Delivery Logs</h3>
+              <p className="text-sm text-slate-500 mb-5">Latest webhook attempts and retry outcomes.</p>
+
+              {webhookLogs.length === 0 ? (
+                <div className="empty-state">No webhook deliveries recorded yet.</div>
+              ) : (
+                <div className="space-y-3">
+                  {webhookLogs.map((log) => (
+                    <div key={log.id} className="tx-row">
+                      <div className="min-w-0 flex-1">
+                        <p className="tx-title">
+                          {log.eventName} · <span className="font-mono text-xs">{shortenAddress(log.webhookId || '')}</span>
+                        </p>
+                        <p className="tx-meta break-all">{log.webhookUrl}</p>
+                        <p className="tx-meta">
+                          Attempts: {Array.isArray(log.attempts) ? log.attempts.length : 0}
+                          {log.deliveredAt ? ` · Delivered ${formatPreciseDateTime(log.deliveredAt)}` : ''}
+                        </p>
+                      </div>
+                      <span className={`tx-status ${log.status === 'success' ? 'confirmed' : 'failed'}`}>
+                        {log.status}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
           </div>
         )}
 

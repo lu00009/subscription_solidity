@@ -4,6 +4,9 @@ const helmet  = require('helmet');
 const morgan  = require('morgan');
 const cron    = require('node-cron');
 const { ethers } = require('ethers');
+const crypto  = require('crypto');
+const http    = require('http');
+const https   = require('https');
 const path    = require('path');
 
 require('dotenv').config({ path: path.resolve(__dirname, '../.env') });
@@ -12,6 +15,13 @@ require('dotenv').config({ path: path.resolve(__dirname, '.env') });
 const app  = express();
 const PORT = Number(process.env.PORT || 3003);
 const MAX_TX_RECORDS = 500;
+const MAX_WEBHOOK_RECORDS = 100;
+const MAX_WEBHOOK_LOG_RECORDS = 2000;
+const WEBHOOK_TIMEOUT_MS = Number(process.env.WEBHOOK_TIMEOUT_MS || 10_000);
+const WEBHOOK_MAX_ATTEMPTS = Math.max(1, Number(process.env.WEBHOOK_MAX_ATTEMPTS || 3));
+const WEBHOOK_RETRY_BASE_MS = Math.max(100, Number(process.env.WEBHOOK_RETRY_BASE_MS || 1500));
+const DEFAULT_WEBHOOK_SECRET = process.env.WEBHOOK_SIGNING_SECRET || '';
+const ADMIN_API_KEY = process.env.ADMIN_API_KEY || '';
 
 // ─── Middleware ────────────────────────────────────────────────────────────────
 app.use(helmet());
@@ -103,7 +113,7 @@ const contractABI = [
     outputs: [
       { internalType: 'uint256', name: 'expiry', type: 'uint256' },
       { internalType: 'uint8',   name: 'tier',   type: 'uint8' },
-      { internalType: 'bool',    name: 'isActive', type: 'bool' }
+      { internalType: 'bool',    name: 'active', type: 'bool' }
     ],
     stateMutability: 'view',
     type: 'function'
@@ -121,6 +131,62 @@ const contractABI = [
     outputs: [{ internalType: 'uint256', name: '', type: 'uint256' }],
     stateMutability: 'view',
     type: 'function'
+  },
+  {
+    anonymous: false,
+    inputs: [
+      { indexed: true, internalType: 'address', name: 'user', type: 'address' },
+      { indexed: false, internalType: 'uint256', name: 'expiry', type: 'uint256' },
+      { indexed: false, internalType: 'uint8', name: 'tier', type: 'uint8' },
+      { indexed: false, internalType: 'uint256', name: 'amount', type: 'uint256' }
+    ],
+    name: 'Subscribed',
+    type: 'event'
+  },
+  {
+    anonymous: false,
+    inputs: [
+      { indexed: true, internalType: 'address', name: 'user', type: 'address' },
+      { indexed: false, internalType: 'uint256', name: 'newExpiry', type: 'uint256' },
+      { indexed: false, internalType: 'uint8', name: 'tier', type: 'uint8' },
+      { indexed: false, internalType: 'uint256', name: 'amount', type: 'uint256' }
+    ],
+    name: 'Renewed',
+    type: 'event'
+  },
+  {
+    anonymous: false,
+    inputs: [{ indexed: true, internalType: 'address', name: 'user', type: 'address' }],
+    name: 'Unsubscribed',
+    type: 'event'
+  },
+  {
+    anonymous: false,
+    inputs: [
+      { indexed: true, internalType: 'address', name: 'owner', type: 'address' },
+      { indexed: false, internalType: 'uint256', name: 'amount', type: 'uint256' }
+    ],
+    name: 'Withdrawn',
+    type: 'event'
+  },
+  {
+    anonymous: false,
+    inputs: [
+      { indexed: true, internalType: 'uint8', name: 'tier', type: 'uint8' },
+      { indexed: false, internalType: 'uint256', name: 'oldPrice', type: 'uint256' },
+      { indexed: false, internalType: 'uint256', name: 'newPrice', type: 'uint256' }
+    ],
+    name: 'TierPriceUpdated',
+    type: 'event'
+  },
+  {
+    anonymous: false,
+    inputs: [
+      { indexed: true, internalType: 'address', name: 'user', type: 'address' },
+      { indexed: false, internalType: 'uint256', name: 'expiry', type: 'uint256' }
+    ],
+    name: 'SubscriptionExpired',
+    type: 'event'
   }
 ];
 
@@ -129,11 +195,23 @@ const runtimeState = {
   provider:     null,
   contract:     null,
   chainId:      null,
-  startupError: null
+  startupError: null,
+  listenersReady: false
 };
 
 // ─── In-memory transaction store ──────────────────────────────────────────────
 const txStore = new Map();
+const webhookStore = new Map();
+const webhookLogStore = [];
+const processedEventIds = new Set();
+const SUPPORTED_WEBHOOK_EVENTS = new Set([
+  'Subscribed',
+  'Renewed',
+  'Unsubscribed',
+  'Withdrawn',
+  'TierPriceUpdated',
+  'SubscriptionExpired'
+]);
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function formatError(error) {
@@ -195,6 +273,225 @@ function listTransactionsForAddress(address, limit = 20) {
     .slice(0, safeLimit);
 }
 
+function getSubscriptionActiveFlag(details) {
+  if (!details) return false;
+  if (typeof details.active === 'boolean') return details.active;
+  if (typeof details.isActive === 'boolean') return details.isActive;
+  return Boolean(details[2]);
+}
+
+function makeWebhookId() {
+  return `wh_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+}
+
+function makeDeliveryLogId() {
+  return `dlv_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+}
+
+function normalizeWebhookEvents(events) {
+  if (!Array.isArray(events) || events.length === 0) {
+    return ['Subscribed', 'Renewed', 'Unsubscribed'];
+  }
+  const unique = Array.from(new Set(events.map((evt) => String(evt).trim())));
+  const supported = unique.filter((evt) => SUPPORTED_WEBHOOK_EVENTS.has(evt));
+  return supported.length > 0 ? supported : ['Subscribed', 'Renewed', 'Unsubscribed'];
+}
+
+function isAdminAuthorized(req) {
+  if (!ADMIN_API_KEY) return true;
+  return req.get('x-api-key') === ADMIN_API_KEY;
+}
+
+function requireAdmin(req, res, next) {
+  if (!isAdminAuthorized(req)) {
+    return res.status(401).json({ error: 'Unauthorized. Missing or invalid x-api-key' });
+  }
+  return next();
+}
+
+function cleanupWebhookStoreIfNeeded() {
+  if (webhookStore.size <= MAX_WEBHOOK_RECORDS) return;
+  const sorted = Array.from(webhookStore.entries())
+    .sort((a, b) => Number(new Date(a[1].createdAt)) - Number(new Date(b[1].createdAt)));
+  const removeCount = webhookStore.size - MAX_WEBHOOK_RECORDS;
+  for (let i = 0; i < removeCount; i++) webhookStore.delete(sorted[i][0]);
+}
+
+function addWebhookLog(log) {
+  webhookLogStore.unshift(log);
+  if (webhookLogStore.length > MAX_WEBHOOK_LOG_RECORDS) {
+    webhookLogStore.length = MAX_WEBHOOK_LOG_RECORDS;
+  }
+}
+
+function cleanupProcessedEvents() {
+  if (processedEventIds.size <= 10_000) return;
+  const keep = Array.from(processedEventIds).slice(-5_000);
+  processedEventIds.clear();
+  keep.forEach((id) => processedEventIds.add(id));
+}
+
+function signWebhookPayload(secret, timestamp, eventName, payloadText) {
+  const signedData = `${timestamp}.${eventName}.${payloadText}`;
+  return crypto.createHmac('sha256', secret).update(signedData).digest('hex');
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function sendJsonWebhook(url, payloadText, headers = {}, timeoutMs = WEBHOOK_TIMEOUT_MS) {
+  return new Promise((resolve, reject) => {
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch (_error) {
+      reject(new Error('Invalid webhook URL'));
+      return;
+    }
+
+    const client = parsed.protocol === 'https:' ? https : http;
+    const req = client.request({
+      protocol: parsed.protocol,
+      hostname: parsed.hostname,
+      port: parsed.port,
+      path: `${parsed.pathname}${parsed.search}`,
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'content-length': Buffer.byteLength(payloadText),
+        ...headers
+      }
+    }, (res) => {
+      let responseBody = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => { responseBody += chunk; });
+      res.on('end', () => {
+        resolve({
+          statusCode: res.statusCode || 0,
+          body: responseBody
+        });
+      });
+    });
+
+    req.on('error', (error) => reject(error));
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new Error(`Webhook request timeout after ${timeoutMs}ms`));
+    });
+    req.write(payloadText);
+    req.end();
+  });
+}
+
+async function deliverWebhookWithRetry(webhook, eventName, eventId, payload) {
+  const payloadText = JSON.stringify(payload);
+  const signingSecret = webhook.secret || DEFAULT_WEBHOOK_SECRET || '';
+  const attempts = [];
+  let finalStatus = 'failed';
+  let deliveredAt = null;
+
+  for (let attempt = 1; attempt <= WEBHOOK_MAX_ATTEMPTS; attempt++) {
+    const timestamp = String(Date.now());
+    const signature = signingSecret ? signWebhookPayload(signingSecret, timestamp, eventName, payloadText) : null;
+    const headers = {
+      'x-webhook-id': webhook.id,
+      'x-webhook-event': eventName,
+      'x-webhook-event-id': eventId,
+      'x-webhook-timestamp': timestamp
+    };
+
+    if (signature) {
+      headers['x-webhook-signature'] = `sha256=${signature}`;
+    }
+
+    const startedAt = Date.now();
+
+    try {
+      const response = await sendJsonWebhook(webhook.url, payloadText, headers);
+      const durationMs = Date.now() - startedAt;
+      const isSuccess = response.statusCode >= 200 && response.statusCode < 300;
+
+      attempts.push({
+        attempt,
+        status: isSuccess ? 'success' : 'failed',
+        statusCode: response.statusCode,
+        responseBody: response.body ? String(response.body).slice(0, 500) : '',
+        error: null,
+        durationMs,
+        timestamp: new Date().toISOString()
+      });
+
+      if (isSuccess) {
+        finalStatus = 'success';
+        deliveredAt = new Date().toISOString();
+        break;
+      }
+    } catch (error) {
+      attempts.push({
+        attempt,
+        status: 'failed',
+        statusCode: null,
+        responseBody: '',
+        error: formatError(error),
+        durationMs: Date.now() - startedAt,
+        timestamp: new Date().toISOString()
+      });
+    }
+
+    if (attempt < WEBHOOK_MAX_ATTEMPTS) {
+      const delayMs = WEBHOOK_RETRY_BASE_MS * (2 ** (attempt - 1));
+      await sleep(delayMs);
+    }
+  }
+
+  const logRecord = {
+    id: makeDeliveryLogId(),
+    webhookId: webhook.id,
+    webhookUrl: webhook.url,
+    eventName,
+    eventId,
+    status: finalStatus,
+    deliveredAt,
+    attempts,
+    createdAt: new Date().toISOString()
+  };
+
+  addWebhookLog(logRecord);
+  return logRecord;
+}
+
+async function dispatchContractEvent(eventName, payload, eventObject) {
+  if (!eventObject || !eventObject.log) return;
+
+  const txHash = eventObject.log.transactionHash || 'unknown';
+  const logIndex = eventObject.log.index ?? eventObject.log.logIndex ?? '0';
+  const eventId = `${txHash}:${logIndex}`;
+
+  if (processedEventIds.has(eventId)) return;
+  processedEventIds.add(eventId);
+  cleanupProcessedEvents();
+
+  const webhooks = Array.from(webhookStore.values()).filter((webhook) => (
+    webhook.active && webhook.events.includes(eventName)
+  ));
+
+  if (webhooks.length === 0) return;
+
+  const eventPayload = {
+    id: eventId,
+    event: eventName,
+    chainId: runtimeState.chainId,
+    contractAddress: CONTRACT_ADDRESS,
+    blockNumber: eventObject.log.blockNumber || null,
+    transactionHash: txHash,
+    logIndex: Number(logIndex),
+    emittedAt: new Date().toISOString(),
+    data: payload
+  };
+
+  await Promise.all(webhooks.map((webhook) => deliverWebhookWithRetry(webhook, eventName, eventId, eventPayload)));
+}
+
 function isContractConfigured() {
   return Boolean(CONTRACT_ADDRESS && ethers.isAddress(CONTRACT_ADDRESS));
 }
@@ -214,6 +511,88 @@ function ensureContractReady(res) {
   return false;
 }
 
+function attachContractEventListeners() {
+  if (!runtimeState.contract || runtimeState.listenersReady) return;
+
+  runtimeState.contract.removeAllListeners();
+
+  runtimeState.contract.on('Subscribed', async (user, expiry, tier, amount, event) => {
+    try {
+      await dispatchContractEvent('Subscribed', {
+        user,
+        expiry: expiry.toString(),
+        tier: Number(tier),
+        amountWei: amount.toString(),
+        amountEth: ethers.formatEther(amount)
+      }, event);
+    } catch (error) {
+      console.error('[backend] Failed to dispatch Subscribed webhook:', formatError(error));
+    }
+  });
+
+  runtimeState.contract.on('Renewed', async (user, newExpiry, tier, amount, event) => {
+    try {
+      await dispatchContractEvent('Renewed', {
+        user,
+        newExpiry: newExpiry.toString(),
+        tier: Number(tier),
+        amountWei: amount.toString(),
+        amountEth: ethers.formatEther(amount)
+      }, event);
+    } catch (error) {
+      console.error('[backend] Failed to dispatch Renewed webhook:', formatError(error));
+    }
+  });
+
+  runtimeState.contract.on('Unsubscribed', async (user, event) => {
+    try {
+      await dispatchContractEvent('Unsubscribed', { user }, event);
+    } catch (error) {
+      console.error('[backend] Failed to dispatch Unsubscribed webhook:', formatError(error));
+    }
+  });
+
+  runtimeState.contract.on('Withdrawn', async (owner, amount, event) => {
+    try {
+      await dispatchContractEvent('Withdrawn', {
+        owner,
+        amountWei: amount.toString(),
+        amountEth: ethers.formatEther(amount)
+      }, event);
+    } catch (error) {
+      console.error('[backend] Failed to dispatch Withdrawn webhook:', formatError(error));
+    }
+  });
+
+  runtimeState.contract.on('TierPriceUpdated', async (tier, oldPrice, newPrice, event) => {
+    try {
+      await dispatchContractEvent('TierPriceUpdated', {
+        tier: Number(tier),
+        oldPriceWei: oldPrice.toString(),
+        oldPriceEth: ethers.formatEther(oldPrice),
+        newPriceWei: newPrice.toString(),
+        newPriceEth: ethers.formatEther(newPrice)
+      }, event);
+    } catch (error) {
+      console.error('[backend] Failed to dispatch TierPriceUpdated webhook:', formatError(error));
+    }
+  });
+
+  runtimeState.contract.on('SubscriptionExpired', async (user, expiry, event) => {
+    try {
+      await dispatchContractEvent('SubscriptionExpired', {
+        user,
+        expiry: expiry.toString()
+      }, event);
+    } catch (error) {
+      console.error('[backend] Failed to dispatch SubscriptionExpired webhook:', formatError(error));
+    }
+  });
+
+  runtimeState.listenersReady = true;
+  console.log('[backend] Contract event listeners attached');
+}
+
 // ─── Contract initialisation ──────────────────────────────────────────────────
 async function initializeContract() {
   runtimeState.startupError = null;
@@ -231,12 +610,15 @@ async function initializeContract() {
     runtimeState.provider = provider;
     runtimeState.chainId  = Number(network.chainId);
     runtimeState.contract = new ethers.Contract(CONTRACT_ADDRESS, contractABI, provider);
+    runtimeState.listenersReady = false;
+    attachContractEventListeners();
 
     console.log(`[backend] Contract initialised on chain ${runtimeState.chainId}`);
   } catch (error) {
     runtimeState.provider     = null;
     runtimeState.contract     = null;
     runtimeState.chainId      = null;
+    runtimeState.listenersReady = false;
     runtimeState.startupError = formatError(error);
     console.error('[backend] Failed to initialise contract:', runtimeState.startupError);
   }
@@ -256,7 +638,10 @@ app.get('/api/health', (_req, res) => {
     contractAddress:     CONTRACT_ADDRESS || null,
     rpcUrl:              RPC_URL,
     startupError:        runtimeState.startupError,
-    transactionRecords:  txStore.size
+    transactionRecords:  txStore.size,
+    webhookRecords:      webhookStore.size,
+    webhookLogs:         webhookLogStore.length,
+    listenersReady:      runtimeState.listenersReady
   });
 });
 
@@ -346,10 +731,11 @@ app.get('/api/status/:address', async (req, res) => {
 
     const expiry = Number(details.expiry);
     const now    = Math.floor(Date.now() / 1000);
+    const active = getSubscriptionActiveFlag(details);
 
     return res.json({
       address,
-      isActive:      details.isActive,
+      isActive:      active,
       expiry:        details.expiry.toString(),
       tier:          Number(details.tier),
       expiryDate:    expiry > 0 ? new Date(expiry * 1000).toISOString() : null,
@@ -431,6 +817,152 @@ app.patch('/api/transactions/:id', (req, res) => {
   }
 });
 
+// Webhook system summary
+app.get('/api/webhooks/summary', requireAdmin, (_req, res) => {
+  const webhooks = Array.from(webhookStore.values());
+  const active = webhooks.filter((w) => w.active).length;
+  const recentLogs = webhookLogStore.slice(0, 100);
+  const successful = recentLogs.filter((log) => log.status === 'success').length;
+  const failed = recentLogs.filter((log) => log.status === 'failed').length;
+
+  res.json({
+    totalWebhooks: webhooks.length,
+    activeWebhooks: active,
+    supportedEvents: Array.from(SUPPORTED_WEBHOOK_EVENTS),
+    recentDelivery: {
+      checked: recentLogs.length,
+      success: successful,
+      failed
+    }
+  });
+});
+
+// Register webhook endpoint
+app.post('/api/webhooks', requireAdmin, (req, res) => {
+  const { url, events, secret, description } = req.body || {};
+  if (!url) return res.status(400).json({ error: 'url is required' });
+
+  try {
+    const parsed = new URL(url);
+    if (!['http:', 'https:'].includes(parsed.protocol)) {
+      return res.status(400).json({ error: 'Webhook url must use http or https' });
+    }
+
+    const record = {
+      id: makeWebhookId(),
+      url,
+      events: normalizeWebhookEvents(events),
+      secret: typeof secret === 'string' ? secret : '',
+      description: typeof description === 'string' ? description : '',
+      active: true,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+
+    webhookStore.set(record.id, record);
+    cleanupWebhookStoreIfNeeded();
+    return res.status(201).json({ message: 'Webhook registered', webhook: record });
+  } catch (_error) {
+    return res.status(400).json({ error: 'Invalid webhook url' });
+  }
+});
+
+// List registered webhooks
+app.get('/api/webhooks', requireAdmin, (_req, res) => {
+  const hooks = Array.from(webhookStore.values())
+    .sort((a, b) => Number(new Date(b.createdAt)) - Number(new Date(a.createdAt)));
+  res.json({ count: hooks.length, webhooks: hooks });
+});
+
+// Update webhook
+app.patch('/api/webhooks/:id', requireAdmin, (req, res) => {
+  const existing = webhookStore.get(req.params.id);
+  if (!existing) {
+    return res.status(404).json({ error: 'Webhook not found' });
+  }
+
+  const { url, events, secret, description, active } = req.body || {};
+  let nextUrl = existing.url;
+
+  if (typeof url === 'string' && url) {
+    try {
+      const parsed = new URL(url);
+      if (!['http:', 'https:'].includes(parsed.protocol)) {
+        return res.status(400).json({ error: 'Webhook url must use http or https' });
+      }
+      nextUrl = url;
+    } catch (_error) {
+      return res.status(400).json({ error: 'Invalid webhook url' });
+    }
+  }
+
+  const updated = {
+    ...existing,
+    url: nextUrl,
+    events: Array.isArray(events) ? normalizeWebhookEvents(events) : existing.events,
+    secret: typeof secret === 'string' ? secret : existing.secret,
+    description: typeof description === 'string' ? description : existing.description,
+    active: typeof active === 'boolean' ? active : existing.active,
+    updatedAt: new Date().toISOString()
+  };
+
+  webhookStore.set(updated.id, updated);
+  return res.json({ message: 'Webhook updated', webhook: updated });
+});
+
+// Delete webhook
+app.delete('/api/webhooks/:id', requireAdmin, (req, res) => {
+  const existed = webhookStore.delete(req.params.id);
+  if (!existed) {
+    return res.status(404).json({ error: 'Webhook not found' });
+  }
+  return res.json({ message: 'Webhook deleted' });
+});
+
+// Manually test webhook delivery
+app.post('/api/webhooks/:id/test', requireAdmin, async (req, res) => {
+  const webhook = webhookStore.get(req.params.id);
+  if (!webhook) {
+    return res.status(404).json({ error: 'Webhook not found' });
+  }
+
+  const eventId = `manual-test-${Date.now()}`;
+  const payload = {
+    id: eventId,
+    event: 'ManualTest',
+    chainId: runtimeState.chainId,
+    contractAddress: CONTRACT_ADDRESS || null,
+    blockNumber: null,
+    transactionHash: null,
+    logIndex: null,
+    emittedAt: new Date().toISOString(),
+    data: {
+      message: 'Manual webhook test from subscription-backend'
+    }
+  };
+
+  try {
+    const delivery = await deliverWebhookWithRetry(webhook, 'ManualTest', eventId, payload);
+    return res.json({ message: 'Test delivery completed', delivery });
+  } catch (error) {
+    return res.status(500).json({ error: 'Test delivery failed', details: formatError(error) });
+  }
+});
+
+// Webhook delivery logs
+app.get('/api/webhooks/logs', requireAdmin, (req, res) => {
+  const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 500);
+  const webhookId = req.query.webhookId ? String(req.query.webhookId) : null;
+  const status = req.query.status ? String(req.query.status).toLowerCase() : null;
+
+  const logs = webhookLogStore
+    .filter((log) => !webhookId || log.webhookId === webhookId)
+    .filter((log) => !status || log.status === status)
+    .slice(0, limit);
+
+  res.json({ count: logs.length, logs });
+});
+
 // Expiry reminder check
 app.post('/api/reminder', async (req, res) => {
   const { addresses } = req.body;
@@ -450,7 +982,7 @@ app.post('/api/reminder', async (req, res) => {
     try {
       const details = await runtimeState.contract.getSubscriptionDetails(address);
       const expiry  = Number(details.expiry);
-      if (details.isActive && expiry <= oneWeekFromNow) {
+      if (getSubscriptionActiveFlag(details) && expiry <= oneWeekFromNow) {
         expiringSubscriptions.push({
           address,
           expiry:          details.expiry.toString(),
